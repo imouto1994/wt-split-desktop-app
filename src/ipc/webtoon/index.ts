@@ -1,0 +1,23 @@
+/**
+ * Composes all webtoon handlers into a single namespace object
+ * that gets registered on the oRPC router in src/ipc/router.ts.
+ *
+ * The renderer calls these as ipc.client.webtoon.<handler>(...).
+ */
+import {
+  mergeSegments,
+  pickInput,
+  pickOutput,
+  processWebtoon,
+  showInFolder,
+  splitSegment,
+} from "./handlers";
+
+export const webtoon = {
+  pickInput,
+  pickOutput,
+  processWebtoon,
+  splitSegment,
+  mergeSegments,
+  showInFolder,
+};

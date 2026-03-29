@@ -1,8 +1,8 @@
 {
-  "name": "electron-shadcn",
-  "productName": "electron-shadcn Template",
-  "version": "1.4.0",
-  "description": "Electron Forge with shadcn-ui (Vite + Typescript)",
+  "name": "wt-split-desktop-app",
+  "productName": "Webtoon Stitch & Split",
+  "version": "1.0.0",
+  "description": "Desktop app for stitching and splitting webtoon images",
   "main": ".vite/build/main.js",
   "private": true,
   "scripts": {
@@ -41,6 +41,7 @@
     "react-dom": "^19.2.4",
     "react-i18next": "^16.6.2",
     "shadcn": "^4.1.0",
+    "sharp": "^0.34.5",
     "tailwind-merge": "^3.5.0",
     "update-electron-app": "^3.1.2",
     "zod": "^4.3.6"
