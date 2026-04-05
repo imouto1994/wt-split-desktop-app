@@ -25,3 +25,15 @@ export const mergeSegmentsInputSchema = z.object({
 export const showInFolderInputSchema = z.object({
   filePath: z.string(),
 });
+
+/** Input for writing/updating the metadata.json sidecar after mutations. */
+export const writeMetadataInputSchema = z.object({
+  outputDir: z.string(),
+  segments: z.array(
+    z.object({
+      filename: z.string(),
+      topGapColor: z.string().nullable(),
+      bottomGapColor: z.string().nullable(),
+    }),
+  ),
+});

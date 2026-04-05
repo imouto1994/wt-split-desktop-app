@@ -40,7 +40,7 @@ src/
     webtoon/
       processor.ts            # Image stitching, gap detection, segment I/O, multi-split, merge
       handlers.ts             # oRPC handlers: pickInput, pickOutput, processWebtoon,
-                              #   splitSegment, mergeSegments, showInFolder
+                              #   writeMetadata, splitSegment, mergeSegments, showInFolder
       schemas.ts              # Zod input schemas
       index.ts                # Composes handlers into the webtoon namespace
     app/                      # App info handlers (platform, version)
@@ -55,7 +55,7 @@ src/
     index.tsx                 # Main page: webtoon processor UI
   components/
     webtoon/
-      types.ts                # SegmentMeta interface + toLocalFileUrl utility
+      types.ts                # SegmentMeta (paths, dimensions, splitGroup, gap colors) + toLocalFileUrl
       folder-picker.tsx       # Button + path display
       status-display.tsx      # Colored status text
       segment-list.tsx        # Ordered list of segment paths and heights
@@ -107,6 +107,7 @@ npm run make
 - **Output folder**: User may choose explicitly; if omitted, defaults to `<inputDir>/images_output`.
 - **Pre-run behavior**: The output directory is deleted and recreated on each full "Process" run.
 - **Segment files**: `segment_000.png`, `segment_001.png`, ... zero-padded to three digits.
+- **Sidecar**: `metadata.json` is written alongside the segment PNGs. It holds per-segment gap color metadata (`topGapColor`, `bottomGapColor`) for the web app’s admin upload flow. The file is created/updated by the processor after a full process run and kept in sync after manual split/merge via the `writeMetadata` handler.
 
 ### Stitching
 
@@ -138,6 +139,7 @@ Constants in `src/ipc/webtoon/processor.ts`:
 - **Disk effect**:
   - N+1 new files: `<basename>_<timestamp>_a<ext>`, `..._b`, `..._c`, etc. in the same directory.
   - The original file is deleted after successful split.
+- **Gap colors after split**: Child segments inherit gap colors from the parent: the **first** child keeps the parent’s `topGapColor`, the **last** child keeps the parent’s `bottomGapColor`, and **middle** children get `null` for both (or the appropriate null for interior boundaries). After split, **`writeMetadata`** is invoked so `metadata.json` stays aligned with the new files.
 - **UI refresh**: The in-memory segment list removes the old path and appends metadata for all new files; the grid re-sorts by path (numeric-aware). All new sub-segments share a `splitGroup` ID.
 
 ### Undo / Merge
@@ -146,6 +148,7 @@ Constants in `src/ipc/webtoon/processor.ts`:
 - Each sub-segment shows an amber **"Undo split (merge group)"** button in the grid.
 - Clicking it on any member merges **all** members of that group back into a single file by vertically stitching them.
 - The merge writes a new `merged_<timestamp>.png` file in the same directory and deletes the individual sub-segment files.
+- **Gap colors after merge**: The merged segment’s `topGapColor` comes from the **first** child’s `topGapColor`, and `bottomGapColor` from the **last** child’s `bottomGapColor`. After merge, **`writeMetadata`** updates `metadata.json` for the output directory.
 
 ### Preview & Listing
 
@@ -180,7 +183,7 @@ Aggregates all handler namespaces:
 
 | Namespace | Handlers |
 |-----------|----------|
-| `webtoon` | `pickInput`, `pickOutput`, `processWebtoon`, `splitSegment`, `mergeSegments`, `showInFolder` |
+| `webtoon` | `pickInput`, `pickOutput`, `processWebtoon`, `writeMetadata`, `splitSegment`, `mergeSegments`, `showInFolder` |
 | `app` | `currentPlatfom`, `appVersion` |
 | `shell` | `openExternalLink` |
 | `theme` | `getCurrentThemeMode`, `toggleThemeMode`, `setThemeMode` |
@@ -192,7 +195,8 @@ Aggregates all handler namespaces:
 |---------|-------------|
 | `pickInput` | `dialog.showOpenDialog(window, { properties: ["openDirectory"] })` — returns path or null |
 | `pickOutput` | `dialog.showOpenDialog(window, { properties: ["openDirectory", "createDirectory"] })` — returns path or null |
-| `processWebtoon` | Resolves `outputDir` default, calls `processor.processWebtoon()`, returns `{ outputDir, files }` |
+| `processWebtoon` | Resolves `outputDir` default, calls `processor.processWebtoon()`, returns `{ outputDir, segments }` (each segment includes path + gap colors) |
+| `writeMetadata` | Takes `{ outputDir, segments: { filename, topGapColor, bottomGapColor }[] }`, writes or overwrites `metadata.json` in that directory (used after split/merge to keep the sidecar in sync) |
 | `splitSegment` | Takes `{ filePath, breakpoints: number[] }`, calls `processor.splitSegment()`, returns `{ files }` (N+1 paths) |
 | `mergeSegments` | Takes `{ filePaths, outputPath }`, calls `processor.mergeSegments()`, returns `{ file }` (merged path) |
 | `showInFolder` | Calls `shell.showItemInFolder(filePath)` to reveal a file in the OS file manager |
@@ -203,7 +207,9 @@ The `pickInput` and `pickOutput` handlers use the `ipcContext.mainWindowContext`
 
 Pure Node/Sharp module with no Electron imports. Exports:
 
-- `processWebtoon({ inputDir, outputDir })` → `Promise<string[]>` (written file paths)
+- **Types**: `ProcessedSegment` (`{ filePath, topGapColor, bottomGapColor }`), `SegmentGapMeta` (gap metadata shape used when serializing sidecar data).
+- `processWebtoon({ inputDir, outputDir })` → `Promise<ProcessedSegment[]>` — writes segment PNGs, captures **top/bottom gap colors** from removed uniform strips, and writes **`metadata.json`** in the output directory.
+- `writeMetadataJson(outputDir, segments: SegmentGapMeta[])` — writes or overwrites **`metadata.json`** from an array of `{ filename, topGapColor, bottomGapColor }` (exported for handlers and any caller that needs to refresh the sidecar without re-running the full pipeline).
 - `splitSegment({ filePath, breakpoints })` → `Promise<string[]>` (N+1 new paths; deletes original)
 - `mergeSegments({ filePaths, outputPath })` → `Promise<string>` (merged path; deletes inputs)
 
@@ -255,7 +261,8 @@ Bridges a `MessagePort` from the renderer to the main process for the oRPC conne
 ### Renderer UI
 
 - **`src/routes/index.tsx`**: Single page with folder pickers, process button, status display, segment list, segment grid, and split editor modal.
-- **State**: `inputDir`, `outputDir`, `segments[]` (with optional `splitGroup`), `statusMessage`, `statusMode`, `isProcessing`, `editingSegment`.
+- **`SegmentMeta`** (`src/components/webtoon/types.ts`): Renderer segment state includes `topGapColor: string | null` and `bottomGapColor: string | null` alongside path, dimensions, and optional `splitGroup`.
+- **State**: `inputDir`, `outputDir`, `segments[]` (with optional `splitGroup` and gap colors), `statusMessage`, `statusMode`, `isProcessing`, `editingSegment`.
 - **`loadSegmentMetadata`**: Creates `new Image()` elements with `local-file://localhost/...` URLs to read `naturalWidth`/`naturalHeight` for each segment. Accepts an optional `splitGroup` tag to assign to the resulting metas.
 - **Sorting**: Segments are always sorted by path with `localeCompare({ numeric: true, sensitivity: "base" })`.
 

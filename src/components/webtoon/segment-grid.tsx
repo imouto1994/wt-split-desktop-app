@@ -74,6 +74,31 @@ export default function SegmentGrid({
                 )}
               </div>
             </div>
+            {/* Gap color swatches — each swatch only renders when its
+                specific color is non-null, avoiding confusion where a null
+                fallback to black looks identical to an actual #000000. */}
+            {(seg.topGapColor || seg.bottomGapColor) && (
+              <div className="flex items-center gap-3 text-xs">
+                {seg.topGapColor && (
+                  <span className="flex items-center gap-1">
+                    Top
+                    <span
+                      className="inline-block size-3 rounded-sm border border-border"
+                      style={{ backgroundColor: seg.topGapColor }}
+                    />
+                  </span>
+                )}
+                {seg.bottomGapColor && (
+                  <span className="flex items-center gap-1">
+                    Btm
+                    <span
+                      className="inline-block size-3 rounded-sm border border-border"
+                      style={{ backgroundColor: seg.bottomGapColor }}
+                    />
+                  </span>
+                )}
+              </div>
+            )}
             {/* Segments produced by a manual split show an undo button.
                 Clicking it merges all siblings in the same split group. */}
             {seg.splitGroup && (

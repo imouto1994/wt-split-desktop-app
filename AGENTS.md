@@ -38,6 +38,8 @@
 
 3. **Inline "why" comments** — Add comments for non-obvious logic: trade-offs, workarounds, business rules, algorithm explanations, and anything a future agent would need context to understand. Do NOT add comments that just restate what the code does.
 
+4. **NEVER remove existing comments that are still correct.** When refactoring or rewriting code, preserve every inline comment that still accurately describes the logic it annotates. Only remove a comment if the code it describes has been deleted or the comment is factually wrong. Losing a correct comment means losing context that future agents depend on.
+
 **Why this matters:** Future agents read code comments before documentation. Well-commented code prevents them from misunderstanding intent and introducing regressions.
 
 ## Essentials

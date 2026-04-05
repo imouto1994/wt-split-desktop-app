@@ -4,6 +4,17 @@ export interface SegmentMeta {
   width: number;
   height: number;
   /**
+   * Hex color of the bottom-most row of the gap that was removed above
+   * this segment during auto-split, or null if no gap was above it.
+   * Used by the web app reader to color the gap between segments.
+   */
+  topGapColor: string | null;
+  /**
+   * Hex color of the top-most row of the gap that was removed below
+   * this segment during auto-split, or null if no gap was below it.
+   */
+  bottomGapColor: string | null;
+  /**
    * When a segment is produced by a manual split, all sibling sub-segments
    * share the same splitGroup ID. This enables the "undo split" feature —
    * clicking merge on any member re-stitches the entire group.

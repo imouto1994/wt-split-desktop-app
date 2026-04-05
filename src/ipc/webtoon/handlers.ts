@@ -21,11 +21,13 @@ import {
   processWebtoonInputSchema,
   showInFolderInputSchema,
   splitSegmentInputSchema,
+  writeMetadataInputSchema,
 } from "./schemas";
 import {
   mergeSegments as runMergeSegments,
   processWebtoon as runProcessWebtoon,
   splitSegment as runSplitSegment,
+  writeMetadataJson,
 } from "./processor";
 
 /** Opens a native directory picker for the input folder. */
@@ -56,6 +58,7 @@ export const pickOutput = os
 /**
  * Runs the full stitch + auto-split pipeline.
  * If outputDir is omitted, defaults to <inputDir>/images_output.
+ * Returns per-segment metadata including gap colors from removed strips.
  */
 export const processWebtoon = os
   .input(processWebtoonInputSchema)
@@ -63,11 +66,11 @@ export const processWebtoon = os
     const { inputDir, outputDir } = input;
     if (!inputDir) throw new Error("Input directory is required.");
     const finalOutput = outputDir || path.join(inputDir, "images_output");
-    const files = await runProcessWebtoon({
+    const segments = await runProcessWebtoon({
       inputDir,
       outputDir: finalOutput,
     });
-    return { outputDir: finalOutput, files };
+    return { outputDir: finalOutput, segments };
   });
 
 /**
@@ -102,4 +105,23 @@ export const showInFolder = os
   .input(showInFolderInputSchema)
   .handler(({ input }) => {
     shell.showItemInFolder(input.filePath);
+  });
+
+/**
+ * Writes/overwrites metadata.json in the output directory with the current
+ * segment gap color state. Called after processWebtoon (automatic), and after
+ * splitSegment / mergeSegments (manual) to keep the sidecar in sync.
+ */
+export const writeMetadata = os
+  .input(writeMetadataInputSchema)
+  .handler(async ({ input }) => {
+    const { outputDir, segments } = input;
+    await writeMetadataJson(
+      outputDir,
+      segments.map((s) => ({
+        filePath: path.join(outputDir, s.filename),
+        topGapColor: s.topGapColor ?? null,
+        bottomGapColor: s.bottomGapColor ?? null,
+      })),
+    );
   });

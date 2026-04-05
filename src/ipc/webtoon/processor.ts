@@ -9,7 +9,9 @@
  *   2. Stitch them into one tall vertical strip (handling EXIF orientation)
  *   3. Scan the strip row-by-row to find large uniform-color gaps
  *   4. Split at the gaps to produce individual PNG segments
- *   5. Optionally, manually split/merge segments after the fact
+ *   5. Capture gap colors (top/bottom of each removed strip) per segment
+ *   6. Write a metadata.json sidecar with gap color info for the web app
+ *   7. Optionally, manually split/merge segments after the fact
  */
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -48,11 +50,46 @@ interface ImageMeta {
 interface Slice {
   top: number;
   height: number;
+  /** Hex color of the bottom-most row of the gap above this slice, or null. */
+  topGapColor: string | null;
+  /** Hex color of the top-most row of the gap below this slice, or null. */
+  bottomGapColor: string | null;
+}
+
+interface RgbColor {
+  r: number;
+  g: number;
+  b: number;
 }
 
 interface UniformRun {
   start: number;
   end: number;
+  /** Color of the first row in the run (reference pixel). */
+  topColor: RgbColor;
+  /** Color of the last row in the run (reference pixel). */
+  bottomColor: RgbColor;
+}
+
+/**
+ * Per-segment metadata returned by processWebtoon, pairing the written file
+ * path with the gap colors extracted during the auto-split pipeline.
+ */
+export interface ProcessedSegment {
+  filePath: string;
+  topGapColor: string | null;
+  bottomGapColor: string | null;
+}
+
+/**
+ * Shape of a single entry in the metadata.json sidecar written alongside
+ * segment PNGs. Used by the web app's admin upload flow to attach gap
+ * colors to segment records in the database.
+ */
+export interface SegmentGapMeta {
+  filename: string;
+  topGapColor: string | null;
+  bottomGapColor: string | null;
 }
 
 /**
@@ -65,13 +102,14 @@ interface UniformRun {
  *   4. Materialize to buffer then re-open — this guarantees a concrete pixel
  *      grid before the raw RGBA scan (avoids Sharp lazy-pipeline issues)
  *   5. Find uniform row runs, build slices from gaps, write segment PNGs
+ *   6. Write metadata.json sidecar with per-segment gap colors
  *
- * @returns Absolute paths to all written segment files.
+ * @returns Per-segment metadata including file paths and gap colors.
  */
 export async function processWebtoon({
   inputDir,
   outputDir,
-}: ProcessWebtoonInput): Promise<string[]> {
+}: ProcessWebtoonInput): Promise<ProcessedSegment[]> {
   const imagePaths = await readImagePaths(inputDir);
   if (!imagePaths.length) {
     throw new Error(`No images found in ${inputDir}`);
@@ -109,7 +147,18 @@ export async function processWebtoon({
     outputDir,
     info.width,
   );
-  return written;
+
+  // Build ProcessedSegment results pairing file paths with gap colors.
+  const segments: ProcessedSegment[] = written.map((filePath, i) => ({
+    filePath,
+    topGapColor: slices[i].topGapColor,
+    bottomGapColor: slices[i].bottomGapColor,
+  }));
+
+  // Write metadata.json sidecar so the web app admin upload can read gap colors.
+  await writeMetadataJson(outputDir, segments);
+
+  return segments;
 }
 
 /**
@@ -309,7 +358,9 @@ async function createStitchedImage(
 /**
  * findUniformRowRuns scans raw RGBA pixel data row-by-row and identifies
  * contiguous vertical runs where every row is "uniform" (single-color within
- * tolerance). Returns an array of { start, end } row ranges.
+ * tolerance). Returns an array of { start, end, topColor, bottomColor } row
+ * ranges, where topColor/bottomColor are the reference pixel of the first
+ * and last rows of each run (used for gap coloring in the reader).
  */
 function findUniformRowRuns(
   data: Buffer,
@@ -326,25 +377,42 @@ function findUniformRowRuns(
       runStart = y;
     }
     if (!uniform && runStart !== -1) {
-      runs.push({ start: runStart, end: y });
+      runs.push({
+        start: runStart,
+        end: y,
+        topColor: getRowColor(data, width, runStart),
+        bottomColor: getRowColor(data, width, y - 1),
+      });
       runStart = -1;
     }
   }
 
   // Handle a run that extends to the bottom edge of the image.
   if (runStart !== -1) {
-    runs.push({ start: runStart, end: height });
+    runs.push({
+      start: runStart,
+      end: height,
+      topColor: getRowColor(data, width, runStart),
+      bottomColor: getRowColor(data, width, height - 1),
+    });
   }
 
   return runs;
 }
 
 /**
- * buildSlicesFromRuns converts uniform row runs into content slices.
+ * buildSlicesFromRuns converts uniform row runs into content slices with
+ * associated gap colors.
  *
  * Only runs taller than minGapHeight are treated as removable gaps.
  * Content between (and after) those gaps becomes output slices.
  * Short uniform runs are absorbed into the surrounding content.
+ *
+ * For each slice, topGapColor is the bottom-row color of the preceding gap
+ * (the row closest to this slice's top edge), and bottomGapColor is the
+ * top-row color of the following gap (the row closest to this slice's
+ * bottom edge). These are stored so the web reader can render the original
+ * gap color between adjacent segments.
  */
 function buildSlicesFromRuns(
   runs: UniformRun[],
@@ -353,6 +421,9 @@ function buildSlicesFromRuns(
 ): Slice[] {
   const slices: Slice[] = [];
   let cursor = 0;
+  // Track the most recently skipped (removable) gap so we can assign its
+  // bottomColor as the next slice's topGapColor.
+  let lastGap: UniformRun | null = null;
 
   for (const run of runs) {
     const runHeight = run.end - run.start;
@@ -362,15 +433,27 @@ function buildSlicesFromRuns(
 
     // Content from cursor to the start of this gap becomes a slice.
     if (run.start > cursor) {
-      slices.push({ top: cursor, height: run.start - cursor });
+      slices.push({
+        top: cursor,
+        height: run.start - cursor,
+        topGapColor: lastGap ? rgbToHex(lastGap.bottomColor) : null,
+        // bottomGapColor will be filled in by the next gap (or left null).
+        bottomGapColor: rgbToHex(run.topColor),
+      });
     }
+    lastGap = run;
     // Advance cursor past the gap.
     cursor = run.end;
   }
 
   // Trailing content after the last gap.
   if (cursor < imageHeight) {
-    slices.push({ top: cursor, height: imageHeight - cursor });
+    slices.push({
+      top: cursor,
+      height: imageHeight - cursor,
+      topGapColor: lastGap ? rgbToHex(lastGap.bottomColor) : null,
+      bottomGapColor: null,
+    });
   }
 
   return slices;
@@ -400,6 +483,38 @@ async function writeSlices(
     index += 1;
   }
   return files;
+}
+
+/**
+ * Extracts the RGB color of the first pixel in a given row.
+ * Used to capture the reference color of gap boundaries.
+ */
+function getRowColor(data: Buffer, width: number, rowIndex: number): RgbColor {
+  const offset = rowIndex * width * 4;
+  return { r: data[offset], g: data[offset + 1], b: data[offset + 2] };
+}
+
+/** Converts an RGB color to a lowercase hex string (e.g. "#ff00aa"). */
+function rgbToHex({ r, g, b }: RgbColor): string {
+  return `#${[r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/**
+ * Writes a metadata.json sidecar file in the output directory.
+ * Maps each segment filename to its gap colors so the web app's admin
+ * upload flow can attach them to segment DB records.
+ */
+export async function writeMetadataJson(
+  outputDir: string,
+  segments: ProcessedSegment[],
+): Promise<void> {
+  const entries: SegmentGapMeta[] = segments.map((seg) => ({
+    filename: path.basename(seg.filePath),
+    topGapColor: seg.topGapColor,
+    bottomGapColor: seg.bottomGapColor,
+  }));
+  const json = JSON.stringify({ segments: entries }, null, 2);
+  await fs.writeFile(path.join(outputDir, "metadata.json"), json, "utf-8");
 }
 
 /**

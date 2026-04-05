@@ -17,7 +17,7 @@ export function pickOutputFolder() {
   return ipc.client.webtoon.pickOutput();
 }
 
-/** Runs the full stitch + auto-split pipeline. Returns { outputDir, files }. */
+/** Runs the full stitch + auto-split pipeline. Returns { outputDir, segments }. */
 export function processWebtoon(payload: {
   inputDir: string;
   outputDir?: string;
@@ -51,4 +51,19 @@ export function mergeSegments(payload: {
 /** Reveals a file in the OS file manager (Finder on macOS, Explorer on Windows). */
 export function showInFolder(filePath: string) {
   return ipc.client.webtoon.showInFolder({ filePath });
+}
+
+/**
+ * Writes/overwrites metadata.json in the output directory with the current
+ * segment gap color state. Called after split/merge to keep the sidecar in sync.
+ */
+export function writeMetadata(payload: {
+  outputDir: string;
+  segments: {
+    filename: string;
+    topGapColor: string | null;
+    bottomGapColor: string | null;
+  }[];
+}) {
+  return ipc.client.webtoon.writeMetadata(payload);
 }

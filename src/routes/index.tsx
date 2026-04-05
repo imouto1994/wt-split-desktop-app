@@ -19,6 +19,7 @@ import {
   pickOutputFolder,
   processWebtoon,
   splitSegment,
+  writeMetadata,
 } from "@/actions/webtoon";
 import FolderPicker from "@/components/webtoon/folder-picker";
 import SegmentGrid from "@/components/webtoon/segment-grid";
@@ -37,21 +38,29 @@ type StatusMode = "info" | "ok" | "warn" | "error";
  * @param opts.splitGroup - Group ID shared by all sub-segments from one split.
  * @param opts.splitOriginalPath - Original file path before the split, so
  *   merging can restore the filename and preserve sort position.
+ * @param opts.gapColors - Per-file gap colors to attach. Indices match `files`.
  */
 function loadSegmentMetadata(
   files: string[],
-  opts?: { splitGroup?: string; splitOriginalPath?: string },
+  opts?: {
+    splitGroup?: string;
+    splitOriginalPath?: string;
+    gapColors?: { topGapColor: string | null; bottomGapColor: string | null }[];
+  },
 ): Promise<SegmentMeta[]> {
   return Promise.all(
     files.map(
-      (file) =>
+      (file, i) =>
         new Promise<SegmentMeta>((resolve) => {
+          const colors = opts?.gapColors?.[i];
           const img = new Image();
           img.onload = () =>
             resolve({
               path: file,
               width: img.naturalWidth || 0,
               height: img.naturalHeight || 0,
+              topGapColor: colors?.topGapColor ?? null,
+              bottomGapColor: colors?.bottomGapColor ?? null,
               splitGroup: opts?.splitGroup,
               splitOriginalPath: opts?.splitOriginalPath,
             });
@@ -62,6 +71,8 @@ function loadSegmentMetadata(
               path: file,
               width: 0,
               height: 0,
+              topGapColor: colors?.topGapColor ?? null,
+              bottomGapColor: colors?.bottomGapColor ?? null,
               splitGroup: opts?.splitGroup,
               splitOriginalPath: opts?.splitOriginalPath,
             });
@@ -84,6 +95,8 @@ function sortSegments(segs: SegmentMeta[]): SegmentMeta[] {
 function HomePage() {
   const [inputDir, setInputDir] = useState("");
   const [outputDir, setOutputDir] = useState("");
+  /** The resolved output directory from the last processWebtoon run. */
+  const [resolvedOutputDir, setResolvedOutputDir] = useState("");
   const [segments, setSegments] = useState<SegmentMeta[]>([]);
   const [resultSummary, setResultSummary] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
@@ -97,6 +110,29 @@ function HomePage() {
     (message: string, mode: StatusMode = "info") => {
       setStatusMessage(message);
       setStatusMode(mode);
+    },
+    [],
+  );
+
+  /**
+   * Writes metadata.json to the output directory with the current segment
+   * gap color state. Fire-and-forget — failures are logged but not surfaced.
+   * Uses the oRPC writeMetadata handler which runs in the main process.
+   */
+  const syncMetadata = useCallback(
+    (segs: SegmentMeta[], outDir: string) => {
+      if (!outDir) return;
+      writeMetadata({
+        outputDir: outDir,
+        segments: segs.map((s) => ({
+          // Extract filename from absolute path; renderer can't use node:path.
+          filename: s.path.split(/[\\/]/).pop()!,
+          topGapColor: s.topGapColor,
+          bottomGapColor: s.bottomGapColor,
+        })),
+      }).catch(() => {
+        // Best-effort sync; failing silently is acceptable here.
+      });
     },
     [],
   );
@@ -145,10 +181,19 @@ function HomePage() {
         inputDir,
         outputDir: outputDir || undefined,
       });
-      const { files, outputDir: resolvedOutput } = res;
-      setStatus(`Done. Wrote ${files.length} files.`, "ok");
+      const { segments: processed, outputDir: resolvedOutput } = res;
+      setStatus(`Done. Wrote ${processed.length} files.`, "ok");
       setResultSummary(`Output folder: ${resolvedOutput}`);
-      const metas = await loadSegmentMetadata(files);
+      setResolvedOutputDir(resolvedOutput);
+      const metas = await loadSegmentMetadata(
+        processed.map((s) => s.filePath),
+        {
+          gapColors: processed.map((s) => ({
+            topGapColor: s.topGapColor,
+            bottomGapColor: s.bottomGapColor,
+          })),
+        },
+      );
       setSegments(sortSegments(metas));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -170,24 +215,37 @@ function HomePage() {
    * Called when the split editor saves. Sends breakpoints to the main process,
    * then replaces the original segment in state with the newly created slices.
    * All new slices share a splitGroup ID so they can be merged back later.
+   *
+   * Gap color inheritance: the first child gets the parent's topGapColor,
+   * the last child gets the parent's bottomGapColor, middle children get null.
+   * This is done here (not in the processor) because splitSegment is a pure
+   * Sharp function unaware of gap color metadata.
    */
   const handleSaveSplit = useCallback(
     async (filePath: string, breakpointsPx: number[]) => {
       try {
         setStatus("Splitting segment\u2026");
+        const parent = segments.find((s) => s.path === filePath);
         const res = await splitSegment({ filePath, breakpoints: breakpointsPx });
         // Tag all new sub-segments with a shared group ID and remember the
         // original path so merging can restore the filename and sort position.
         const groupId = `split_${Date.now()}`;
+        const numChildren = res.files.length;
+        const gapColors = res.files.map((_, i) => ({
+          topGapColor: i === 0 ? (parent?.topGapColor ?? null) : null,
+          bottomGapColor:
+            i === numChildren - 1 ? (parent?.bottomGapColor ?? null) : null,
+        }));
         const newMetas = await loadSegmentMetadata(res.files, {
           splitGroup: groupId,
           splitOriginalPath: filePath,
+          gapColors,
         });
-        setSegments((prev) =>
-          sortSegments(
-            prev.filter((s) => s.path !== filePath).concat(newMetas),
-          ),
+        const updated = sortSegments(
+          segments.filter((s) => s.path !== filePath).concat(newMetas),
         );
+        setSegments(updated);
+        syncMetadata(updated, resolvedOutputDir);
         setStatus(
           `Split into ${newMetas.length} parts. Heights: ${newMetas.map((m) => m.height).join(", ")}px`,
           "ok",
@@ -198,13 +256,17 @@ function HomePage() {
         setStatus(`Error: ${message}`, "error");
       }
     },
-    [setStatus],
+    [setStatus, segments, syncMetadata, resolvedOutputDir],
   );
 
   /**
    * Merges all segments in a split group back into one file.
    * Writes the merged output to the original pre-split filename so it
    * sorts back to its original position among siblings.
+   *
+   * Gap color restoration: the merged segment recovers topGapColor from
+   * the first child and bottomGapColor from the last child, restoring
+   * the original gap color state from before the split.
    */
   const handleMerge = useCallback(
     async (groupId: string) => {
@@ -227,20 +289,29 @@ function HomePage() {
         const filePaths = groupSegments.map((s) => s.path);
 
         await mergeSegments({ filePaths, outputPath });
-        const newMetas = await loadSegmentMetadata([outputPath]);
+        // Recover gap colors: first child's top + last child's bottom.
+        const restoredGapColors = [
+          {
+            topGapColor: groupSegments[0].topGapColor,
+            bottomGapColor: groupSegments[groupSegments.length - 1].bottomGapColor,
+          },
+        ];
+        const newMetas = await loadSegmentMetadata([outputPath], {
+          gapColors: restoredGapColors,
+        });
         const groupPaths = new Set(filePaths);
-        setSegments((prev) =>
-          sortSegments(
-            prev.filter((s) => !groupPaths.has(s.path)).concat(newMetas),
-          ),
+        const updated = sortSegments(
+          segments.filter((s) => !groupPaths.has(s.path)).concat(newMetas),
         );
+        setSegments(updated);
+        syncMetadata(updated, resolvedOutputDir);
         setStatus("Merged back into 1 segment.", "ok");
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         setStatus(`Error: ${message}`, "error");
       }
     },
-    [segments, setStatus],
+    [segments, setStatus, syncMetadata, resolvedOutputDir],
   );
 
   return (

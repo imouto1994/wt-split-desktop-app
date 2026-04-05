@@ -11,6 +11,7 @@ import {
   processWebtoon,
   showInFolder,
   splitSegment,
+  writeMetadata,
 } from "./handlers";
 
 export const webtoon = {
@@ -20,4 +21,5 @@ export const webtoon = {
   splitSegment,
   mergeSegments,
   showInFolder,
+  writeMetadata,
 };
