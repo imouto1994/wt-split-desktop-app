@@ -34,12 +34,13 @@ type StatusMode = "info" | "ok" | "warn" | "error";
  * Image elements with local-file:// URLs. This mirrors the prototype's
  * approach of reading naturalWidth/naturalHeight from the browser engine.
  *
- * @param splitGroup - Optional group ID to tag all resulting metas with,
- *   used for the undo/merge feature.
+ * @param opts.splitGroup - Group ID shared by all sub-segments from one split.
+ * @param opts.splitOriginalPath - Original file path before the split, so
+ *   merging can restore the filename and preserve sort position.
  */
 function loadSegmentMetadata(
   files: string[],
-  splitGroup?: string,
+  opts?: { splitGroup?: string; splitOriginalPath?: string },
 ): Promise<SegmentMeta[]> {
   return Promise.all(
     files.map(
@@ -51,12 +52,19 @@ function loadSegmentMetadata(
               path: file,
               width: img.naturalWidth || 0,
               height: img.naturalHeight || 0,
-              splitGroup,
+              splitGroup: opts?.splitGroup,
+              splitOriginalPath: opts?.splitOriginalPath,
             });
           // Resolve with zero dimensions on error so the UI still renders
           // (the thumbnail will show a broken image icon).
           img.onerror = () =>
-            resolve({ path: file, width: 0, height: 0, splitGroup });
+            resolve({
+              path: file,
+              width: 0,
+              height: 0,
+              splitGroup: opts?.splitGroup,
+              splitOriginalPath: opts?.splitOriginalPath,
+            });
           img.src = toLocalFileUrl(file);
         }),
     ),
@@ -168,9 +176,13 @@ function HomePage() {
       try {
         setStatus("Splitting segment\u2026");
         const res = await splitSegment({ filePath, breakpoints: breakpointsPx });
-        // Tag all new sub-segments with a shared group ID for undo/merge.
+        // Tag all new sub-segments with a shared group ID and remember the
+        // original path so merging can restore the filename and sort position.
         const groupId = `split_${Date.now()}`;
-        const newMetas = await loadSegmentMetadata(res.files, groupId);
+        const newMetas = await loadSegmentMetadata(res.files, {
+          splitGroup: groupId,
+          splitOriginalPath: filePath,
+        });
         setSegments((prev) =>
           sortSegments(
             prev.filter((s) => s.path !== filePath).concat(newMetas),
@@ -191,9 +203,8 @@ function HomePage() {
 
   /**
    * Merges all segments in a split group back into one file.
-   * Finds all segments with the given groupId, sorts them by path
-   * (so they're in the correct top-to-bottom order), stitches them,
-   * and replaces the group members in state with the single merged file.
+   * Writes the merged output to the original pre-split filename so it
+   * sorts back to its original position among siblings.
    */
   const handleMerge = useCallback(
     async (groupId: string) => {
@@ -204,15 +215,18 @@ function HomePage() {
 
       try {
         setStatus("Merging segments\u2026");
-        const dir = groupSegments[0].path.substring(
-          0,
-          groupSegments[0].path.lastIndexOf("/"),
-        );
-        const outputPath = `${dir}/merged_${Date.now()}.png`;
+
+        // Restore the original filename so the merged file sorts to the
+        // same position it had before the split. Fall back to a timestamped
+        // name if the original path wasn't tracked (shouldn't happen).
+        const originalPath = groupSegments[0].splitOriginalPath;
+        const outputPath =
+          originalPath ??
+          `${groupSegments[0].path.substring(0, groupSegments[0].path.lastIndexOf("/"))}/merged_${Date.now()}.png`;
+
         const filePaths = groupSegments.map((s) => s.path);
 
         await mergeSegments({ filePaths, outputPath });
-        // The merged file has no splitGroup — it's a fresh standalone segment.
         const newMetas = await loadSegmentMetadata([outputPath]);
         const groupPaths = new Set(filePaths);
         setSegments((prev) =>

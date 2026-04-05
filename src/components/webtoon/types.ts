@@ -10,6 +10,12 @@ export interface SegmentMeta {
    * Segments from the initial auto-split pipeline have no splitGroup.
    */
   splitGroup?: string;
+  /**
+   * The absolute path of the original segment before it was split.
+   * Stored so that merging (undo) can write the output back to the
+   * original filename, preserving its sort position among siblings.
+   */
+  splitOriginalPath?: string;
 }
 
 /**
