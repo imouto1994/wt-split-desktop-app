@@ -17,23 +17,42 @@ export function pickOutputFolder() {
   return ipc.client.webtoon.pickOutput();
 }
 
-/** Runs the full stitch + auto-split pipeline. Returns { outputDir, segments }. */
+/**
+ * Runs the full stitch + auto-split pipeline. Returns { outputDir, segments }.
+ * Optionally accepts overrides for the gap-detection parameters.
+ */
 export function processWebtoon(payload: {
   inputDir: string;
   outputDir?: string;
+  minGapHeight?: number;
+  colorTolerance?: number;
 }) {
   return ipc.client.webtoon.processWebtoon(payload);
 }
 
 /**
  * Splits a segment at the given breakpoints (pixel positions from top).
- * Returns { files } with N+1 paths. The original file is deleted.
+ * Returns { files, edgeStrips } with N+1 paths and per-sub-segment edge
+ * strip data (1px-tall PNG data URIs at interior boundaries) for gradient
+ * gap rendering. When `keepOriginal` is true, the original file is
+ * preserved for the staged editing workflow.
  */
 export function splitSegment(payload: {
   filePath: string;
   breakpoints: number[];
+  keepOriginal?: boolean;
 }) {
   return ipc.client.webtoon.splitSegment(payload);
+}
+
+/**
+ * Batch-deletes files from disk. Used by staged editing for Confirm,
+ * Discard, and undo-split cleanup. Returns { failed } with paths that
+ * could not be deleted (e.g. locked by another process on Windows).
+ * Callers must guard with `filePaths.length > 0` before calling.
+ */
+export function deleteFiles(filePaths: string[]) {
+  return ipc.client.webtoon.deleteFiles({ filePaths });
 }
 
 /**
@@ -55,7 +74,8 @@ export function showInFolder(filePath: string) {
 
 /**
  * Writes/overwrites metadata.json in the output directory with the current
- * segment gap color state. Called after split/merge to keep the sidecar in sync.
+ * segment gap color and edge strip state. Called on Confirm to finalize
+ * staged edits.
  */
 export function writeMetadata(payload: {
   outputDir: string;
@@ -63,6 +83,10 @@ export function writeMetadata(payload: {
     filename: string;
     topGapColor: string | null;
     bottomGapColor: string | null;
+    topEdgeStrip?: string | null;
+    bottomEdgeStrip?: string | null;
+    topEdgeStripIsLight?: boolean | null;
+    bottomEdgeStripIsLight?: boolean | null;
   }[];
 }) {
   return ipc.client.webtoon.writeMetadata(payload);

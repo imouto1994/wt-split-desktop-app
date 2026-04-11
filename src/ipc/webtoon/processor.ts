@@ -12,28 +12,35 @@
  *   5. Capture gap colors (top/bottom of each removed strip) per segment
  *   6. Write a metadata.json sidecar with gap color info for the web app
  *   7. Optionally, manually split/merge segments after the fact
+ *   8. Edge strips: manual splits extract 1px-tall PNG data URIs at interior
+ *      boundaries for gradient rendering in the web reader
  */
 import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
-
-// Contiguous uniform rows shorter than this are kept as part of the content.
-// Only runs >= 100px tall are treated as removable gaps between segments.
-const MIN_GAP_HEIGHT = 100;
-
-// Per-channel (R, G, B, A) tolerance when deciding if a row is "uniform."
-// A value of 10 accommodates JPEG artifacts and slight color gradients in
-// backgrounds that should still count as blank space.
-const COLOR_TOLERANCE = 10;
+import {
+  DEFAULT_COLOR_TOLERANCE,
+  DEFAULT_MIN_GAP_HEIGHT,
+} from "@/constants";
 
 interface ProcessWebtoonInput {
   inputDir: string;
   outputDir: string;
+  /** Override the default minimum gap height (px) for gap detection. */
+  minGapHeight?: number;
+  /** Override the default per-channel color tolerance for uniform row detection. */
+  colorTolerance?: number;
 }
 
 interface SplitSegmentInput {
   filePath: string;
   breakpoints: number[];
+  /**
+   * When true, the original file is preserved on disk after splitting.
+   * Used by the staged editing workflow so the original can be restored
+   * if the user undoes the split before confirming.
+   */
+  keepOriginal?: boolean;
 }
 
 interface MergeSegmentsInput {
@@ -72,24 +79,51 @@ interface UniformRun {
 }
 
 /**
+ * Edge strip data for a single sub-segment produced by splitSegment.
+ * Each field is a `data:image/png;base64,...` URI of a 1px-tall strip
+ * capturing the pixel row at that boundary, or null for exterior edges
+ * (where the parent's gap color or edge strip is inherited by the renderer).
+ */
+export interface EdgeStripData {
+  topEdgeStrip: string | null;
+  bottomEdgeStrip: string | null;
+  topEdgeStripIsLight: boolean | null;
+  bottomEdgeStripIsLight: boolean | null;
+}
+
+/**
  * Per-segment metadata returned by processWebtoon, pairing the written file
  * path with the gap colors extracted during the auto-split pipeline.
+ * Edge strips are null for most auto-split segments; the first and last
+ * segments get edge strips at the chapter boundaries (where gap color is null).
  */
 export interface ProcessedSegment {
   filePath: string;
   topGapColor: string | null;
   bottomGapColor: string | null;
+  topEdgeStrip: string | null;
+  bottomEdgeStrip: string | null;
+  topEdgeStripIsLight: boolean | null;
+  bottomEdgeStripIsLight: boolean | null;
 }
 
 /**
  * Shape of a single entry in the metadata.json sidecar written alongside
  * segment WebP files. Used by the web app's admin upload flow to attach gap
- * colors to segment records in the database.
+ * colors and edge strip data to segment records in the database.
  */
 export interface SegmentGapMeta {
   filename: string;
   topGapColor: string | null;
   bottomGapColor: string | null;
+  /** data:image/png;base64 URI of the 1px-tall top content edge, or null. */
+  topEdgeStrip: string | null;
+  /** data:image/png;base64 URI of the 1px-tall bottom content edge, or null. */
+  bottomEdgeStrip: string | null;
+  /** Whether the top edge strip's average luminance is light (> 128). */
+  topEdgeStripIsLight: boolean | null;
+  /** Whether the bottom edge strip's average luminance is light (> 128). */
+  bottomEdgeStripIsLight: boolean | null;
 }
 
 /**
@@ -109,6 +143,8 @@ export interface SegmentGapMeta {
 export async function processWebtoon({
   inputDir,
   outputDir,
+  minGapHeight,
+  colorTolerance,
 }: ProcessWebtoonInput): Promise<ProcessedSegment[]> {
   const imagePaths = await readImagePaths(inputDir);
   if (!imagePaths.length) {
@@ -137,9 +173,13 @@ export async function processWebtoon({
     data,
     info.width,
     info.height,
-    COLOR_TOLERANCE,
+    colorTolerance ?? DEFAULT_COLOR_TOLERANCE,
   );
-  const slices = buildSlicesFromRuns(uniformRuns, info.height, MIN_GAP_HEIGHT);
+  const slices = buildSlicesFromRuns(
+    uniformRuns,
+    info.height,
+    minGapHeight ?? DEFAULT_MIN_GAP_HEIGHT,
+  );
 
   const written = await writeSlices(
     stitchedSharp,
@@ -149,16 +189,62 @@ export async function processWebtoon({
   );
 
   // Build ProcessedSegment results pairing file paths with gap colors.
+  // Interior auto-split segments have proper gap colors from the removed
+  // uniform bands, so edge strips are null for those.
   const segments: ProcessedSegment[] = written.map((filePath, i) => ({
     filePath,
     topGapColor: slices[i].topGapColor,
     bottomGapColor: slices[i].bottomGapColor,
+    topEdgeStrip: null,
+    bottomEdgeStrip: null,
+    topEdgeStripIsLight: null,
+    bottomEdgeStripIsLight: null,
   }));
+
+  // Extract edge strips for the chapter boundary segments (first top,
+  // last bottom) where gap color is null because no uniform gap was
+  // removed at that boundary. These enable gradient rendering in the
+  // web reader's column bottom gap and future column top gap.
+  if (segments.length > 0) {
+    const firstSlice = slices[0];
+    const firstStrip = await extractEdgeStrip(
+      stitchedSharp,
+      firstSlice.top,
+      info.width,
+    );
+    segments[0].topEdgeStrip = firstStrip.dataUri;
+    segments[0].topEdgeStripIsLight = firstStrip.isLight;
+
+    const lastSlice = slices[slices.length - 1];
+    const lastRow = lastSlice.top + lastSlice.height - 1;
+    const lastStrip = await extractEdgeStrip(
+      stitchedSharp,
+      lastRow,
+      info.width,
+    );
+    segments[segments.length - 1].bottomEdgeStrip = lastStrip.dataUri;
+    segments[segments.length - 1].bottomEdgeStripIsLight = lastStrip.isLight;
+  }
 
   // Write metadata.json sidecar so the web app admin upload can read gap colors.
   await writeMetadataJson(outputDir, segments);
 
   return segments;
+}
+
+/**
+ * Result of splitSegment: file paths for each sub-segment plus edge strip
+ * data for interior boundaries (used for gradient gap rendering in the reader).
+ */
+export interface SplitSegmentResult {
+  files: string[];
+  /**
+   * Parallel array to `files`. Each entry has the edge strip data for that
+   * sub-segment. Interior boundaries get extracted pixel rows; exterior edges
+   * (first-top, last-bottom) are null — the renderer fills those from the
+   * parent segment's metadata (gap color or edge strip inheritance).
+   */
+  edgeStrips: EdgeStripData[];
 }
 
 /**
@@ -168,14 +254,21 @@ export async function processWebtoon({
  * from the top of the image, sorted ascending. Each slice is extracted with
  * sharp.extract() and written with a suffix like _a, _b, _c, etc.
  *
- * The original file is deleted after all slices are written successfully.
+ * Unless `keepOriginal` is set, the original file is deleted after all slices
+ * are written successfully. The staged editing workflow sets `keepOriginal`
+ * so the original can be restored on undo without re-stitching.
  *
- * @returns Absolute paths to all newly created slice files.
+ * After writing slices, extracts 1px-tall PNG edge strips at interior split
+ * boundaries (where gap colors will be null). These data URIs let the web
+ * reader render gradient fade-outs instead of harsh black gaps.
+ *
+ * @returns File paths and per-sub-segment edge strip data.
  */
 export async function splitSegment({
   filePath,
   breakpoints,
-}: SplitSegmentInput): Promise<string[]> {
+  keepOriginal,
+}: SplitSegmentInput): Promise<SplitSegmentResult> {
   const meta = await sharp(filePath).metadata();
   if (!meta.width || !meta.height) {
     throw new Error("Unable to read image metadata.");
@@ -216,8 +309,34 @@ export async function splitSegment({
     outputPaths.push(outPath);
   }
 
-  await fs.rm(filePath, { force: true });
-  return outputPaths;
+  // Extract 1px-tall edge strips at interior split boundaries BEFORE
+  // potentially deleting the source file. The source is needed for extraction.
+  const numChildren = edges.length - 1;
+  const sourceSharp = sharp(filePath);
+  const edgeStrips: EdgeStripData[] = [];
+  for (let i = 0; i < numChildren; i++) {
+    // Exterior edges (first-top, last-bottom) are null — the renderer
+    // inherits the parent's gap color or edge strip for those.
+    const isFirst = i === 0;
+    const isLast = i === numChildren - 1;
+    const topResult = isFirst
+      ? null
+      : await extractEdgeStrip(sourceSharp, edges[i], width);
+    const bottomResult = isLast
+      ? null
+      : await extractEdgeStrip(sourceSharp, edges[i + 1] - 1, width);
+    edgeStrips.push({
+      topEdgeStrip: topResult?.dataUri ?? null,
+      bottomEdgeStrip: bottomResult?.dataUri ?? null,
+      topEdgeStripIsLight: topResult?.isLight ?? null,
+      bottomEdgeStripIsLight: bottomResult?.isLight ?? null,
+    });
+  }
+
+  if (!keepOriginal) {
+    await fs.rm(filePath, { force: true });
+  }
+  return { files: outputPaths, edgeStrips };
 }
 
 /**
@@ -504,9 +623,45 @@ function rgbToHex({ r, g, b }: RgbColor): string {
 }
 
 /**
+ * Extracts a single pixel row from an image and encodes it as a PNG data URI,
+ * plus computes the average perceived luminance to classify the strip as
+ * light or dark. Used for gradient gap rendering in the web reader and
+ * brightness-aware column bottom gap fill color selection.
+ *
+ * @param source - Sharp instance opened on the source image.
+ * @param row - The 0-indexed row to extract.
+ * @param width - Image width (determines the strip length).
+ * @returns Data URI and brightness classification.
+ */
+async function extractEdgeStrip(
+  source: sharp.Sharp,
+  row: number,
+  width: number,
+): Promise<{ dataUri: string; isLight: boolean }> {
+  const strip = source.clone().extract({ left: 0, top: row, width, height: 1 });
+  const [pngBuffer, { data: rawPixels }] = await Promise.all([
+    strip.clone().png().toBuffer(),
+    strip.clone().ensureAlpha().raw().toBuffer({ resolveWithObject: true }),
+  ]);
+  // Average perceived luminance using the standard Rec. 601 formula
+  let totalLuminance = 0;
+  for (let i = 0; i < rawPixels.length; i += 4) {
+    totalLuminance +=
+      0.299 * rawPixels[i] +
+      0.587 * rawPixels[i + 1] +
+      0.114 * rawPixels[i + 2];
+  }
+  const avgLuminance = totalLuminance / (rawPixels.length / 4);
+  return {
+    dataUri: `data:image/png;base64,${pngBuffer.toString("base64")}`,
+    isLight: avgLuminance > 128,
+  };
+}
+
+/**
  * Writes a metadata.json sidecar file in the output directory.
- * Maps each segment filename to its gap colors so the web app's admin
- * upload flow can attach them to segment DB records.
+ * Maps each segment filename to its gap colors and edge strip data so the
+ * web app's admin upload flow can attach them to segment DB records.
  */
 export async function writeMetadataJson(
   outputDir: string,
@@ -516,6 +671,10 @@ export async function writeMetadataJson(
     filename: path.basename(seg.filePath),
     topGapColor: seg.topGapColor,
     bottomGapColor: seg.bottomGapColor,
+    topEdgeStrip: seg.topEdgeStrip,
+    bottomEdgeStrip: seg.bottomEdgeStrip,
+    topEdgeStripIsLight: seg.topEdgeStripIsLight,
+    bottomEdgeStripIsLight: seg.bottomEdgeStripIsLight,
   }));
   const json = JSON.stringify({ segments: entries }, null, 2);
   await fs.writeFile(path.join(outputDir, "metadata.json"), json, "utf-8");

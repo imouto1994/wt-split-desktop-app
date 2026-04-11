@@ -31,7 +31,7 @@ src/
   preload.ts                  # MessagePort bridge for oRPC
   renderer.ts                 # Entry point → imports app.tsx
   app.tsx                     # React root, RouterProvider, theme/language sync
-  constants/index.ts          # IPC channel names, env vars, feature flags
+  constants/index.ts          # IPC channel names, env vars, feature flags, processing defaults
   ipc/
     handler.ts                # RPCHandler wrapping the router
     manager.ts                # Renderer-side oRPC client (IPCManager)
@@ -40,7 +40,7 @@ src/
     webtoon/
       processor.ts            # Image stitching, gap detection, segment I/O, multi-split, merge
       handlers.ts             # oRPC handlers: pickInput, pickOutput, processWebtoon,
-                              #   writeMetadata, splitSegment, mergeSegments, showInFolder
+                              #   writeMetadata, splitSegment, mergeSegments, deleteFiles, showInFolder
       schemas.ts              # Zod input schemas
       index.ts                # Composes handlers into the webtoon namespace
     app/                      # App info handlers (platform, version)
@@ -55,11 +55,11 @@ src/
     index.tsx                 # Main page: webtoon processor UI
   components/
     webtoon/
-      types.ts                # SegmentMeta (paths, dimensions, splitGroup, gap colors) + toLocalFileUrl
+      types.ts                # SegmentMeta (paths, dimensions, splitGroup, gap colors, edge strips) + toLocalFileUrl
       folder-picker.tsx       # Button + path display
       status-display.tsx      # Colored status text
       segment-list.tsx        # Ordered list of segment paths and heights
-      segment-grid.tsx        # Responsive thumbnail grid with Open / Edit / Undo
+      segment-grid.tsx        # Responsive thumbnail grid with Open / Edit / Hide / Undo
       split-editor-modal.tsx  # Multi-line split editor modal
     ui/                       # shadcn/ui primitives (button, toggle, etc.)
     drag-window-region.tsx    # Custom title bar drag region
@@ -107,7 +107,7 @@ npm run make
 - **Output folder**: User may choose explicitly; if omitted, defaults to `<parentDir>/[Toonwide] <inputDirName>` — a sibling of the input folder (same parent directory as the input, folder name is the input’s basename prefixed with `[Toonwide] `). This keeps outputs grouped next to their source folders, and the `[Toonwide]` prefix lets the web app’s batch chapter import treat those directories as processed output when the admin selects the parent folder.
 - **Pre-run behavior**: The output directory is deleted and recreated on each full "Process" run.
 - **Segment files**: `segment_000.webp`, `segment_001.webp`, ... zero-padded to three digits. All segments use **WebP lossless** encoding for ~20-30% smaller file sizes than PNG with no quality loss.
-- **Sidecar**: `metadata.json` is written alongside the segment WebP files. It holds per-segment gap color metadata (`topGapColor`, `bottomGapColor`) for the web app’s admin upload flow. The file is created/updated by the processor after a full process run and kept in sync after manual split/merge via the `writeMetadata` handler.
+- **Sidecar**: `metadata.json` is written alongside the segment WebP files. It holds per-segment gap color metadata (`topGapColor`, `bottomGapColor`) and edge strip data URIs (`topEdgeStrip`, `bottomEdgeStrip`) for the web app’s admin upload flow. The file is created/updated by the processor after a full process run and kept in sync via the `writeMetadata` handler on Confirm.
 
 ### Stitching
 
@@ -119,45 +119,49 @@ npm run make
 
 1. The stitched image is rendered to a PNG buffer, then re-opened as a Sharp pipeline.
 2. Raw RGBA pixels are scanned row-by-row.
-3. A row is "uniform" if every pixel matches the first pixel within `COLOR_TOLERANCE` per channel (R, G, B, A).
+3. A row is "uniform" if every pixel matches the first pixel within `colorTolerance` per channel (R, G, B, A).
 
-Constants in `src/ipc/webtoon/processor.ts`:
+**Processing parameters** (user-configurable via the UI, with defaults in `src/constants/index.ts`):
 
-- `COLOR_TOLERANCE = 10`
-- `MIN_GAP_HEIGHT = 100` — contiguous runs of uniform rows at least this tall are treated as removable gaps; content between those runs becomes segments.
+- `DEFAULT_COLOR_TOLERANCE = 10` — per-channel tolerance for "single-color" row detection. Range: 0–255.
+- `DEFAULT_MIN_GAP_HEIGHT = 100` — contiguous runs of uniform rows at least this tall are treated as removable gaps; content between those runs becomes segments.
+
+The user can override these per-run in the "Processing Settings" area of the controls card. Empty fields fall back to the defaults. The values are session-only (reset on app restart).
 
 ### Manual Segment Split (Editor)
 
-- **Trigger**: Segments with **height/width ratio greater than 3** show an "Edit" button in the grid (`EDIT_ASPECT_RATIO_THRESHOLD = 3` in `segment-grid.tsx`).
+- **Trigger**: The "Edit" button is available on **all** segments. Segments with **height/width ratio greater than 3** (`EDIT_ASPECT_RATIO_THRESHOLD = 3` in `segment-grid.tsx`) get a prominent **amber** Edit button to signal "recommended split," while shorter segments get a subtle **outline** Edit button for optional splitting.
 - **Multi-line editor**: Modal with the full segment image in a scrollable area. Supports **multiple split lines** — the user can split a segment into 2, 3, or more sub-segments at once.
   - **Default**: Opens with 1 split line at **50% height** of the segment.
   - **Add line**: "Add" button places a new line in the largest gap between existing lines.
   - **Remove line**: Minus icon on each handle removes that line. At least 1 line must remain.
   - **Drag**: Each line is independently draggable. A 24px invisible hit area makes grabbing easy. Each line has a distinct color (emerald, sky, amber, rose, violet, orange) to distinguish them.
   - **Pixel readout**: Each handle badge shows the approximate pixel position from the top.
-- **Save**: Calls `splitSegment` with `{ filePath, breakpoints: number[] }` (array of pixel positions, sorted and clamped).
-- **Disk effect**:
+- **Save**: Calls `splitSegment` with `{ filePath, breakpoints: number[], keepOriginal: true }` (array of pixel positions, sorted and clamped).
+- **Disk effect (staged)**:
   - N+1 new files: `<basename>_<timestamp>_a.webp`, `..._b.webp`, `..._c.webp`, etc. in the same directory. Always WebP lossless regardless of input format.
-  - The original file is deleted after successful split.
-- **Gap colors after split**: Child segments inherit gap colors from the parent: the **first** child keeps the parent’s `topGapColor`, the **last** child keeps the parent’s `bottomGapColor`, and **middle** children get `null` for both (or the appropriate null for interior boundaries). After split, **`writeMetadata`** is invoked so `metadata.json` stays aligned with the new files.
+  - The original file is **preserved** on disk (`keepOriginal: true`) so the split can be undone without re-stitching. The original is only deleted when the user clicks **Confirm**.
+- **Gap colors after split**: Child segments inherit gap colors from the parent: the **first** child keeps the parent’s `topGapColor`, the **last** child keeps the parent’s `bottomGapColor`, and **middle** children get `null` for both (or the appropriate null for interior boundaries). **`metadata.json` is NOT updated** during staging — it is only written on Confirm.
+- **Edge strips after split**: The processor extracts 1px-tall PNG strips at interior split boundaries and returns them as `data:image/png;base64,...` data URIs alongside the file paths (`SplitSegmentResult.edgeStrips`). The renderer inherits exterior edge strips from the parent (first child gets parent's `topEdgeStrip`, last child gets parent's `bottomEdgeStrip`), enabling gradient gap rendering in the web reader. For nested splits, edge strips propagate correctly through the inheritance chain.
 - **UI refresh**: The in-memory segment list removes the old path and appends metadata for all new files; the grid re-sorts by path (numeric-aware). All new sub-segments share a `splitGroup` ID.
 
-### Undo / Merge
+### Undo Split (Staged)
 
 - After a split, all resulting sub-segments are tagged with a shared `splitGroup` ID in the renderer state.
-- Each sub-segment shows an amber **"Undo split (merge group)"** button in the grid.
-- Clicking it on any member merges **all** members of that group back into a single file by vertically stitching them.
-- The merge writes a new WebP lossless file in the same directory (restoring the original filename with `.webp` extension, or `merged_<timestamp>.webp` as fallback) and deletes the individual sub-segment files.
+- Each sub-segment shows an amber **"Undo split (restore original)"** button in the grid (active even on hidden segments).
+- Clicking it on any member **deletes the child files** from disk and **restores the original** segment from the `replacedSegments` state map. No re-stitching via `mergeSegments` is needed — the original file still exists on disk because `keepOriginal` was set.
+- If any children were hidden, they are auto-unhidden when the split is undone.
 - **Gap colors after merge**: The merged segment’s `topGapColor` comes from the **first** child’s `topGapColor`, and `bottomGapColor` from the **last** child’s `bottomGapColor`. After merge, **`writeMetadata`** updates `metadata.json` for the output directory.
 
 ### Preview & Listing
 
-- **List**: Shows each absolute path and decoded height (px).
-- **Grid**: Lazy-loaded thumbnails via `local-file://localhost/...` protocol, index + height.
-- **Open**: Calls `shell.showItemInFolder()` to reveal the file in the OS file manager (Finder / Explorer).
-- **Edit**: Opens the multi-line split editor (when aspect ratio threshold is met).
-- **Undo**: Merges a split group back (when the segment has a `splitGroup`).
-- After splits, filenames may no longer follow strict `segment_XXX.png` ordering; sorting is by full path string (numeric-aware).
+- **List**: Shows each absolute path and decoded height (px) for **visible segments only** (hidden segments are excluded from the list view).
+- **Grid**: Lazy-loaded thumbnails via `local-file://localhost/...` protocol, index + height. Shows **all** segments including hidden ones (dimmed at `opacity-40`). A dynamic summary ("N visible / M total") is shown in the section header.
+- **Open**: Calls `shell.showItemInFolder()` to reveal the file in the OS file manager (Finder / Explorer). Disabled on hidden segments.
+- **Edit**: Opens the multi-line split editor. Available on **all** segments — amber button for recommended splits (ratio > 3), outline button for optional splits. Disabled on hidden segments.
+- **Hide / Unhide**: Toggles segment visibility for the staged editing workflow.
+- **Undo Split**: Restores the original segment by deleting split children (when the segment has a `splitGroup`). Active even on hidden segments.
+- After splits, filenames may no longer follow strict `segment_XXX.webp` ordering; sorting is by full path string (numeric-aware).
 
 ---
 
@@ -183,7 +187,7 @@ Aggregates all handler namespaces:
 
 | Namespace | Handlers |
 |-----------|----------|
-| `webtoon` | `pickInput`, `pickOutput`, `processWebtoon`, `writeMetadata`, `splitSegment`, `mergeSegments`, `showInFolder` |
+| `webtoon` | `pickInput`, `pickOutput`, `processWebtoon`, `writeMetadata`, `splitSegment`, `mergeSegments`, `deleteFiles`, `showInFolder` |
 | `app` | `currentPlatfom`, `appVersion` |
 | `shell` | `openExternalLink` |
 | `theme` | `getCurrentThemeMode`, `toggleThemeMode`, `setThemeMode` |
@@ -195,10 +199,11 @@ Aggregates all handler namespaces:
 |---------|-------------|
 | `pickInput` | `dialog.showOpenDialog(window, { properties: ["openDirectory"] })` — returns path or null |
 | `pickOutput` | `dialog.showOpenDialog(window, { properties: ["openDirectory", "createDirectory"] })` — returns path or null |
-| `processWebtoon` | If `outputDir` is omitted, resolves it to `<parentDir>/[Toonwide] <inputDirName>` (sibling of the input); then calls `processor.processWebtoon()`, returns `{ outputDir, segments }` (each segment includes path + gap colors) |
-| `writeMetadata` | Takes `{ outputDir, segments: { filename, topGapColor, bottomGapColor }[] }`, writes or overwrites `metadata.json` in that directory (used after split/merge to keep the sidecar in sync) |
-| `splitSegment` | Takes `{ filePath, breakpoints: number[] }`, calls `processor.splitSegment()`, returns `{ files }` (N+1 paths) |
-| `mergeSegments` | Takes `{ filePaths, outputPath }`, calls `processor.mergeSegments()`, returns `{ file }` (merged path) |
+| `processWebtoon` | Takes `{ inputDir, outputDir?, minGapHeight?, colorTolerance? }`. If `outputDir` is omitted, resolves it to `<parentDir>/[Toonwide] <inputDirName>` (sibling of the input); forwards processing params to `processor.processWebtoon()`, returns `{ outputDir, segments }` (each segment includes path + gap colors) |
+| `writeMetadata` | Takes `{ outputDir, segments: { filename, topGapColor, bottomGapColor, topEdgeStrip?, bottomEdgeStrip? }[] }`, writes or overwrites `metadata.json` in that directory (called on Confirm to finalize staged edits) |
+| `splitSegment` | Takes `{ filePath, breakpoints: number[], keepOriginal?: boolean }`, calls `processor.splitSegment()`, returns `{ files, edgeStrips }` (N+1 paths + per-sub-segment edge strip data URIs). When `keepOriginal` is true, the original file is preserved for staged undo. |
+| `mergeSegments` | Takes `{ filePaths, outputPath }`, calls `processor.mergeSegments()`, returns `{ file }` (merged path). **Note:** No longer used by the staged undo flow (retained for potential future use). |
+| `deleteFiles` | Takes `{ filePaths: string[] }`, deletes each file via `fs.rm({ force: true })`. Returns `{ failed }` with paths that could not be deleted. Used by staged editing for Confirm, Discard, and undo-split cleanup. |
 | `showInFolder` | Calls `shell.showItemInFolder(filePath)` to reveal a file in the OS file manager |
 
 The `pickInput` and `pickOutput` handlers use the `ipcContext.mainWindowContext` middleware to attach the native dialog to the main `BrowserWindow`.
@@ -207,13 +212,13 @@ The `pickInput` and `pickOutput` handlers use the `ipcContext.mainWindowContext`
 
 Pure Node/Sharp module with no Electron imports. Exports:
 
-- **Types**: `ProcessedSegment` (`{ filePath, topGapColor, bottomGapColor }`), `SegmentGapMeta` (gap metadata shape used when serializing sidecar data).
-- `processWebtoon({ inputDir, outputDir })` → `Promise<ProcessedSegment[]>` — writes segment WebP lossless files, captures **top/bottom gap colors** from removed uniform strips, and writes **`metadata.json`** in the output directory.
-- `writeMetadataJson(outputDir, segments: SegmentGapMeta[])` — writes or overwrites **`metadata.json`** from an array of `{ filename, topGapColor, bottomGapColor }` (exported for handlers and any caller that needs to refresh the sidecar without re-running the full pipeline).
-- `splitSegment({ filePath, breakpoints })` → `Promise<string[]>` (N+1 new paths; deletes original)
+- **Types**: `ProcessedSegment` (`{ filePath, topGapColor, bottomGapColor, topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`), `SegmentGapMeta` (gap + edge strip + brightness metadata for sidecar serialization), `EdgeStripData` (`{ topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`), `SplitSegmentResult` (`{ files, edgeStrips }`).
+- `processWebtoon({ inputDir, outputDir, minGapHeight?, colorTolerance? })` → `Promise<ProcessedSegment[]>` — writes segment WebP lossless files, captures **top/bottom gap colors** from removed uniform strips, and writes **`metadata.json`** in the output directory. Edge strips are `null` for interior auto-split segments. The **first segment's top row** and **last segment's bottom row** get edge strips with brightness classification (`isLight`) for column boundary gap rendering. Processing params fall back to defaults from `src/constants/index.ts` when omitted.
+- `writeMetadataJson(outputDir, segments: ProcessedSegment[])` — writes or overwrites **`metadata.json`** from an array of `{ filename, topGapColor, bottomGapColor, topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`.
+- `splitSegment({ filePath, breakpoints, keepOriginal? })` → `Promise<SplitSegmentResult>` (N+1 file paths + per-sub-segment edge strip data URIs with brightness flags; deletes original unless `keepOriginal` is true). Edge strips are extracted at interior split boundaries as 1px-tall PNG data URIs for gradient gap rendering in the web reader. Each strip includes an `isLight` flag based on average perceived luminance (Rec. 601).
 - `mergeSegments({ filePaths, outputPath })` → `Promise<string>` (merged path; deletes inputs)
 
-Internal helpers: `readImagePaths`, `resetOutputDir`, `createStitchedImage`, `findUniformRowRuns`, `buildSlicesFromRuns`, `writeSlices`, `isUniformRow`.
+Internal helpers: `readImagePaths`, `resetOutputDir`, `createStitchedImage`, `findUniformRowRuns`, `buildSlicesFromRuns`, `writeSlices`, `isUniformRow`, `extractEdgeStrip`.
 
 ### Custom Protocol (`local-file://`)
 
@@ -260,9 +265,9 @@ Bridges a `MessagePort` from the renderer to the main process for the oRPC conne
 
 ### Renderer UI
 
-- **`src/routes/index.tsx`**: Single page with folder pickers, process button, status display, segment list, segment grid, and split editor modal.
-- **`SegmentMeta`** (`src/components/webtoon/types.ts`): Renderer segment state includes `topGapColor: string | null` and `bottomGapColor: string | null` alongside path, dimensions, and optional `splitGroup`.
-- **State**: `inputDir`, `outputDir`, `segments[]` (with optional `splitGroup` and gap colors), `statusMessage`, `statusMode`, `isProcessing`, `editingSegment`.
+- **`src/routes/index.tsx`**: Single page with folder pickers, processing parameters, process button, status display, segment list, segment grid, split editor modal, and staged editing controls (Confirm/Discard).
+- **`SegmentMeta`** (`src/components/webtoon/types.ts`): Renderer segment state includes `topGapColor`, `bottomGapColor`, `topEdgeStrip`, `bottomEdgeStrip` (all `string | null`) alongside path, dimensions, and optional `splitGroup`.
+- **State**: Core state (`inputDir`, `outputDir`, `minGapHeight`, `colorTolerance`), staging state (`baseSegments`, `segments`, `hiddenPaths`, `replacedSegments`, `createdBySplitFiles`), UI state (`statusMessage`, `statusMode`, `isProcessing`, `isCommitting`, `editingSegment`). Derived: `hasPendingChanges`, `visibleSegments`.
 - **`loadSegmentMetadata`**: Creates `new Image()` elements with `local-file://localhost/...` URLs to read `naturalWidth`/`naturalHeight` for each segment. Accepts an optional `splitGroup` tag to assign to the resulting metas.
 - **Sorting**: Segments are always sorted by path with `localeCompare({ numeric: true, sensitivity: "base" })`.
 
@@ -281,10 +286,10 @@ Bridges a `MessagePort` from the renderer to the main process for the oRPC conne
 
 ## Configuration Knobs
 
-Editable in `src/ipc/webtoon/processor.ts`:
+Shared defaults in `src/constants/index.ts` (importable by both main process and renderer):
 
-- `MIN_GAP_HEIGHT` — minimum height (px) of a uniform "gap" run to remove.
-- `COLOR_TOLERANCE` — per-channel tolerance for "single-color" row detection.
+- `DEFAULT_MIN_GAP_HEIGHT = 100` — minimum height (px) of a uniform "gap" run to remove. User-configurable per-run via the Processing Settings UI.
+- `DEFAULT_COLOR_TOLERANCE = 10` — per-channel tolerance for "single-color" row detection. User-configurable per-run via the Processing Settings UI (range: 0–255).
 
 Editable in `src/components/webtoon/segment-grid.tsx`:
 

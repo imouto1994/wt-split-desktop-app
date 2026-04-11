@@ -6,17 +6,20 @@
  *   processWebtoon          — full stitch + auto-split pipeline
  *   splitSegment            — manual multi-breakpoint split
  *   mergeSegments           — undo a split by stitching files back together
+ *   deleteFiles             — batch-delete files (staged editing cleanup)
  *   showInFolder            — reveal a file in the OS file manager
  *
  * Dialog handlers use ipcContext.mainWindowContext middleware to attach the
  * native dialog as a sheet on macOS (or modal on other platforms). Without
  * the parent BrowserWindow reference, the dialog may appear behind the app.
  */
+import fs from "node:fs/promises";
 import path from "node:path";
 import { os } from "@orpc/server";
 import { dialog, shell } from "electron";
 import { ipcContext } from "../context";
 import {
+  deleteFilesInputSchema,
   mergeSegmentsInputSchema,
   processWebtoonInputSchema,
   showInFolderInputSchema,
@@ -67,7 +70,7 @@ export const pickOutput = os
 export const processWebtoon = os
   .input(processWebtoonInputSchema)
   .handler(async ({ input }) => {
-    const { inputDir, outputDir } = input;
+    const { inputDir, outputDir, minGapHeight, colorTolerance } = input;
     if (!inputDir) throw new Error("Input directory is required.");
     const finalOutput =
       outputDir ||
@@ -75,6 +78,8 @@ export const processWebtoon = os
     const segments = await runProcessWebtoon({
       inputDir,
       outputDir: finalOutput,
+      minGapHeight,
+      colorTolerance,
     });
     return { outputDir: finalOutput, segments };
   });
@@ -82,16 +87,25 @@ export const processWebtoon = os
 /**
  * Manually splits a segment at user-defined breakpoints.
  * Accepts an array of pixel positions; produces N+1 output files.
+ * When `keepOriginal` is true, the original file is preserved on disk
+ * for the staged editing workflow (undo without re-stitching).
+ *
+ * Returns file paths plus per-sub-segment edge strip data (1px-tall PNG
+ * data URIs at interior boundaries) for gradient gap rendering.
  */
 export const splitSegment = os
   .input(splitSegmentInputSchema)
   .handler(async ({ input }) => {
-    const { filePath, breakpoints } = input;
+    const { filePath, breakpoints, keepOriginal } = input;
     if (!filePath) {
       throw new Error("filePath is required.");
     }
-    const files = await runSplitSegment({ filePath, breakpoints });
-    return { files };
+    const { files, edgeStrips } = await runSplitSegment({
+      filePath,
+      breakpoints,
+      keepOriginal,
+    });
+    return { files, edgeStrips };
   });
 
 /**
@@ -106,6 +120,30 @@ export const mergeSegments = os
     return { file };
   });
 
+/**
+ * Batch-deletes files from disk. Used by the staged editing workflow:
+ *   - Confirm: deletes hidden segment files and replaced split originals
+ *   - Discard: deletes staged split children to restore the base state
+ *   - Undo split: deletes child files so the original can be restored
+ *
+ * Uses `force: true` to suppress ENOENT (file already deleted externally).
+ * Other errors (EACCES, EPERM) are collected and reported so the caller
+ * knows which files couldn't be removed.
+ */
+export const deleteFiles = os
+  .input(deleteFilesInputSchema)
+  .handler(async ({ input }) => {
+    const failed: string[] = [];
+    for (const filePath of input.filePaths) {
+      try {
+        await fs.rm(filePath, { force: true });
+      } catch {
+        failed.push(filePath);
+      }
+    }
+    return { failed };
+  });
+
 /** Reveals a file in the OS file manager (Finder on macOS, Explorer on Windows). */
 export const showInFolder = os
   .input(showInFolderInputSchema)
@@ -115,8 +153,8 @@ export const showInFolder = os
 
 /**
  * Writes/overwrites metadata.json in the output directory with the current
- * segment gap color state. Called after processWebtoon (automatic), and after
- * splitSegment / mergeSegments (manual) to keep the sidecar in sync.
+ * segment gap color and edge strip state. Called on Confirm to finalize
+ * staged edits, and after processWebtoon for the initial auto-split.
  */
 export const writeMetadata = os
   .input(writeMetadataInputSchema)
@@ -128,6 +166,10 @@ export const writeMetadata = os
         filePath: path.join(outputDir, s.filename),
         topGapColor: s.topGapColor ?? null,
         bottomGapColor: s.bottomGapColor ?? null,
+        topEdgeStrip: s.topEdgeStrip ?? null,
+        bottomEdgeStrip: s.bottomEdgeStrip ?? null,
+        topEdgeStripIsLight: s.topEdgeStripIsLight ?? null,
+        bottomEdgeStripIsLight: s.bottomEdgeStripIsLight ?? null,
       })),
     );
   });

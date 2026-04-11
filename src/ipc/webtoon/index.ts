@@ -5,6 +5,7 @@
  * The renderer calls these as ipc.client.webtoon.<handler>(...).
  */
 import {
+  deleteFiles,
   mergeSegments,
   pickInput,
   pickOutput,
@@ -20,6 +21,7 @@ export const webtoon = {
   processWebtoon,
   splitSegment,
   mergeSegments,
+  deleteFiles,
   showInFolder,
   writeMetadata,
 };

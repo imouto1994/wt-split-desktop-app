@@ -15,6 +15,24 @@ export interface SegmentMeta {
    */
   bottomGapColor: string | null;
   /**
+   * data:image/png;base64 URI of a 1px-tall PNG capturing the top pixel row
+   * of this segment's content. Present at interior split boundaries (where
+   * topGapColor is null) so the web reader can render a gradient fade-out.
+   * For nested splits, the first child inherits the parent's topEdgeStrip.
+   */
+  topEdgeStrip?: string | null;
+  /** Whether the top edge strip's average luminance is light (> 128). */
+  topEdgeStripIsLight?: boolean | null;
+  /**
+   * data:image/png;base64 URI of a 1px-tall PNG capturing the bottom pixel row
+   * of this segment's content. Present at interior split boundaries (where
+   * bottomGapColor is null) so the web reader can render a gradient fade-out.
+   * For nested splits, the last child inherits the parent's bottomEdgeStrip.
+   */
+  bottomEdgeStrip?: string | null;
+  /** Whether the bottom edge strip's average luminance is light (> 128). */
+  bottomEdgeStripIsLight?: boolean | null;
+  /**
    * When a segment is produced by a manual split, all sibling sub-segments
    * share the same splitGroup ID. This enables the "undo split" feature —
    * clicking merge on any member re-stitches the entire group.
