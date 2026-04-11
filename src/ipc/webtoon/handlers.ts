@@ -57,7 +57,11 @@ export const pickOutput = os
 
 /**
  * Runs the full stitch + auto-split pipeline.
- * If outputDir is omitted, defaults to <inputDir>/images_output.
+ * If outputDir is omitted, defaults to a sibling folder named
+ * `[Toonwide] <inputDirName>` next to the input directory.
+ * This convention aligns with the web app's batch chapter import:
+ * the admin selects the parent folder and each `[Toonwide] *` sub-folder
+ * becomes an importable chapter.
  * Returns per-segment metadata including gap colors from removed strips.
  */
 export const processWebtoon = os
@@ -65,7 +69,9 @@ export const processWebtoon = os
   .handler(async ({ input }) => {
     const { inputDir, outputDir } = input;
     if (!inputDir) throw new Error("Input directory is required.");
-    const finalOutput = outputDir || path.join(inputDir, "images_output");
+    const finalOutput =
+      outputDir ||
+      path.join(path.dirname(inputDir), `[Toonwide] ${path.basename(inputDir)}`);
     const segments = await runProcessWebtoon({
       inputDir,
       outputDir: finalOutput,

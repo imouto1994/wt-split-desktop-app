@@ -281,10 +281,13 @@ function HomePage() {
         // Restore the original filename so the merged file sorts to the
         // same position it had before the split. Fall back to a timestamped
         // name if the original path wasn't tracked (shouldn't happen).
+        // Always use .webp extension — if the original was .png (pre-WebP update),
+        // swap the extension so the merge output matches the current format.
         const originalPath = groupSegments[0].splitOriginalPath;
-        const outputPath =
-          originalPath ??
-          `${groupSegments[0].path.substring(0, groupSegments[0].path.lastIndexOf("/"))}/merged_${Date.now()}.png`;
+        const dir = groupSegments[0].path.substring(0, groupSegments[0].path.lastIndexOf("/"));
+        const outputPath = originalPath
+          ? originalPath.replace(/\.[^.]+$/, ".webp")
+          : `${dir}/merged_${Date.now()}.webp`;
 
         const filePaths = groupSegments.map((s) => s.path);
 

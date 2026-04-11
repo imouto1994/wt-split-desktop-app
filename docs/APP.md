@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Desktop application that stitches ordered chapter images into one vertical strip, removes large uniform vertical gaps (blank / single-color bands), exports PNG segments to a folder, and optionally splits oversized segments manually via a visual multi-line editor. The image pipeline uses [Sharp](https://sharp.pixelplumbing.com/).
+Desktop application that stitches ordered chapter images into one vertical strip, removes large uniform vertical gaps (blank / single-color bands), exports WebP lossless segments to a folder, and optionally splits oversized segments manually via a visual multi-line editor. The image pipeline uses [Sharp](https://sharp.pixelplumbing.com/).
 
 This app is a rebuild of the earlier VanillaJS prototype (`webtoon-prototype/electron/`) using a modern stack with React, TypeScript, Tailwind, and oRPC-based IPC. It extends the prototype with multi-breakpoint splitting, undo/merge, and aspect-ratio-based edit triggers.
 
@@ -104,10 +104,10 @@ npm run make
 
 ### Output
 
-- **Output folder**: User may choose explicitly; if omitted, defaults to `<inputDir>/images_output`.
+- **Output folder**: User may choose explicitly; if omitted, defaults to `<parentDir>/[Toonwide] <inputDirName>` — a sibling of the input folder (same parent directory as the input, folder name is the input’s basename prefixed with `[Toonwide] `). This keeps outputs grouped next to their source folders, and the `[Toonwide]` prefix lets the web app’s batch chapter import treat those directories as processed output when the admin selects the parent folder.
 - **Pre-run behavior**: The output directory is deleted and recreated on each full "Process" run.
-- **Segment files**: `segment_000.png`, `segment_001.png`, ... zero-padded to three digits.
-- **Sidecar**: `metadata.json` is written alongside the segment PNGs. It holds per-segment gap color metadata (`topGapColor`, `bottomGapColor`) for the web app’s admin upload flow. The file is created/updated by the processor after a full process run and kept in sync after manual split/merge via the `writeMetadata` handler.
+- **Segment files**: `segment_000.webp`, `segment_001.webp`, ... zero-padded to three digits. All segments use **WebP lossless** encoding for ~20-30% smaller file sizes than PNG with no quality loss.
+- **Sidecar**: `metadata.json` is written alongside the segment WebP files. It holds per-segment gap color metadata (`topGapColor`, `bottomGapColor`) for the web app’s admin upload flow. The file is created/updated by the processor after a full process run and kept in sync after manual split/merge via the `writeMetadata` handler.
 
 ### Stitching
 
@@ -137,7 +137,7 @@ Constants in `src/ipc/webtoon/processor.ts`:
   - **Pixel readout**: Each handle badge shows the approximate pixel position from the top.
 - **Save**: Calls `splitSegment` with `{ filePath, breakpoints: number[] }` (array of pixel positions, sorted and clamped).
 - **Disk effect**:
-  - N+1 new files: `<basename>_<timestamp>_a<ext>`, `..._b`, `..._c`, etc. in the same directory.
+  - N+1 new files: `<basename>_<timestamp>_a.webp`, `..._b.webp`, `..._c.webp`, etc. in the same directory. Always WebP lossless regardless of input format.
   - The original file is deleted after successful split.
 - **Gap colors after split**: Child segments inherit gap colors from the parent: the **first** child keeps the parent’s `topGapColor`, the **last** child keeps the parent’s `bottomGapColor`, and **middle** children get `null` for both (or the appropriate null for interior boundaries). After split, **`writeMetadata`** is invoked so `metadata.json` stays aligned with the new files.
 - **UI refresh**: The in-memory segment list removes the old path and appends metadata for all new files; the grid re-sorts by path (numeric-aware). All new sub-segments share a `splitGroup` ID.
@@ -147,7 +147,7 @@ Constants in `src/ipc/webtoon/processor.ts`:
 - After a split, all resulting sub-segments are tagged with a shared `splitGroup` ID in the renderer state.
 - Each sub-segment shows an amber **"Undo split (merge group)"** button in the grid.
 - Clicking it on any member merges **all** members of that group back into a single file by vertically stitching them.
-- The merge writes a new `merged_<timestamp>.png` file in the same directory and deletes the individual sub-segment files.
+- The merge writes a new WebP lossless file in the same directory (restoring the original filename with `.webp` extension, or `merged_<timestamp>.webp` as fallback) and deletes the individual sub-segment files.
 - **Gap colors after merge**: The merged segment’s `topGapColor` comes from the **first** child’s `topGapColor`, and `bottomGapColor` from the **last** child’s `bottomGapColor`. After merge, **`writeMetadata`** updates `metadata.json` for the output directory.
 
 ### Preview & Listing
@@ -195,7 +195,7 @@ Aggregates all handler namespaces:
 |---------|-------------|
 | `pickInput` | `dialog.showOpenDialog(window, { properties: ["openDirectory"] })` — returns path or null |
 | `pickOutput` | `dialog.showOpenDialog(window, { properties: ["openDirectory", "createDirectory"] })` — returns path or null |
-| `processWebtoon` | Resolves `outputDir` default, calls `processor.processWebtoon()`, returns `{ outputDir, segments }` (each segment includes path + gap colors) |
+| `processWebtoon` | If `outputDir` is omitted, resolves it to `<parentDir>/[Toonwide] <inputDirName>` (sibling of the input); then calls `processor.processWebtoon()`, returns `{ outputDir, segments }` (each segment includes path + gap colors) |
 | `writeMetadata` | Takes `{ outputDir, segments: { filename, topGapColor, bottomGapColor }[] }`, writes or overwrites `metadata.json` in that directory (used after split/merge to keep the sidecar in sync) |
 | `splitSegment` | Takes `{ filePath, breakpoints: number[] }`, calls `processor.splitSegment()`, returns `{ files }` (N+1 paths) |
 | `mergeSegments` | Takes `{ filePaths, outputPath }`, calls `processor.mergeSegments()`, returns `{ file }` (merged path) |
@@ -208,7 +208,7 @@ The `pickInput` and `pickOutput` handlers use the `ipcContext.mainWindowContext`
 Pure Node/Sharp module with no Electron imports. Exports:
 
 - **Types**: `ProcessedSegment` (`{ filePath, topGapColor, bottomGapColor }`), `SegmentGapMeta` (gap metadata shape used when serializing sidecar data).
-- `processWebtoon({ inputDir, outputDir })` → `Promise<ProcessedSegment[]>` — writes segment PNGs, captures **top/bottom gap colors** from removed uniform strips, and writes **`metadata.json`** in the output directory.
+- `processWebtoon({ inputDir, outputDir })` → `Promise<ProcessedSegment[]>` — writes segment WebP lossless files, captures **top/bottom gap colors** from removed uniform strips, and writes **`metadata.json`** in the output directory.
 - `writeMetadataJson(outputDir, segments: SegmentGapMeta[])` — writes or overwrites **`metadata.json`** from an array of `{ filename, topGapColor, bottomGapColor }` (exported for handlers and any caller that needs to refresh the sidecar without re-running the full pipeline).
 - `splitSegment({ filePath, breakpoints })` → `Promise<string[]>` (N+1 new paths; deletes original)
 - `mergeSegments({ filePaths, outputPath })` → `Promise<string>` (merged path; deletes inputs)

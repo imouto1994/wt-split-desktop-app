@@ -8,7 +8,7 @@
  *   1. Read images from a folder, sorted by numeric filename order
  *   2. Stitch them into one tall vertical strip (handling EXIF orientation)
  *   3. Scan the strip row-by-row to find large uniform-color gaps
- *   4. Split at the gaps to produce individual PNG segments
+ *   4. Split at the gaps to produce individual WebP lossless segments
  *   5. Capture gap colors (top/bottom of each removed strip) per segment
  *   6. Write a metadata.json sidecar with gap color info for the web app
  *   7. Optionally, manually split/merge segments after the fact
@@ -83,7 +83,7 @@ export interface ProcessedSegment {
 
 /**
  * Shape of a single entry in the metadata.json sidecar written alongside
- * segment PNGs. Used by the web app's admin upload flow to attach gap
+ * segment WebP files. Used by the web app's admin upload flow to attach gap
  * colors to segment records in the database.
  */
 export interface SegmentGapMeta {
@@ -101,7 +101,7 @@ export interface SegmentGapMeta {
  *   3. Stitch all images into a single tall PNG
  *   4. Materialize to buffer then re-open — this guarantees a concrete pixel
  *      grid before the raw RGBA scan (avoids Sharp lazy-pipeline issues)
- *   5. Find uniform row runs, build slices from gaps, write segment PNGs
+ *   5. Find uniform row runs, build slices from gaps, write segment WebP files
  *   6. Write metadata.json sidecar with per-segment gap colors
  *
  * @returns Per-segment metadata including file paths and gap colors.
@@ -195,7 +195,7 @@ export async function splitSegment({
   // edges = [0, bp1, bp2, ..., height] — defines N+1 vertical slices.
   const edges = [0, ...sorted, height];
   const dir = path.dirname(filePath);
-  const { name, ext } = path.parse(filePath);
+  const { name } = path.parse(filePath);
   const stamp = Date.now();
   const suffixes = "abcdefghijklmnopqrstuvwxyz";
 
@@ -206,9 +206,12 @@ export async function splitSegment({
     // Use letter suffixes (a, b, c, ...) for readability; fall back to index
     // if more than 26 slices (unlikely but safe).
     const suffix = i < suffixes.length ? suffixes[i] : String(i);
-    const outPath = path.join(dir, `${name}_${stamp}_${suffix}${ext}`);
+    // Always output WebP lossless regardless of the input format, so
+    // splitting old PNG segments still produces WebP sub-segments.
+    const outPath = path.join(dir, `${name}_${stamp}_${suffix}.webp`);
     await sharp(filePath)
       .extract({ left: 0, top, width, height: sliceHeight })
+      .webp({ lossless: true })
       .toFile(outPath);
     outputPaths.push(outPath);
   }
@@ -222,8 +225,8 @@ export async function splitSegment({
  * This is the inverse of splitSegment — used for the "undo split" feature.
  *
  * All input files are resized to the widest file's width (preserving aspect ratio),
- * then composited top-to-bottom on a transparent RGBA canvas. The merged PNG is
- * written to outputPath and all input files are deleted.
+ * then composited top-to-bottom on a transparent RGBA canvas. The merged WebP
+ * lossless file is written to outputPath and all input files are deleted.
  *
  * @returns The outputPath that was written.
  */
@@ -267,7 +270,7 @@ export async function mergeSegments({
     },
   })
     .composite(composites)
-    .png()
+    .webp({ lossless: true })
     .toFile(outputPath);
 
   for (const file of filePaths) {
@@ -459,7 +462,7 @@ function buildSlicesFromRuns(
   return slices;
 }
 
-/** writeSlices extracts each slice from the stitched image and writes it as a PNG. */
+/** writeSlices extracts each slice from the stitched image and writes it as WebP lossless. */
 async function writeSlices(
   stitched: sharp.Sharp,
   slices: Slice[],
@@ -472,12 +475,13 @@ async function writeSlices(
     if (slice.height <= 0) {
       continue;
     }
-    const filename = `segment_${String(index).padStart(3, "0")}.png`;
+    const filename = `segment_${String(index).padStart(3, "0")}.webp`;
     const outPath = path.join(dir, filename);
     // .clone() is required because Sharp pipelines are consumed on first use.
     await stitched
       .clone()
       .extract({ left: 0, top: slice.top, width, height: slice.height })
+      .webp({ lossless: true })
       .toFile(outPath);
     files.push(outPath);
     index += 1;
