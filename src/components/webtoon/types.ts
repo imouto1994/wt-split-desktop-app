@@ -45,6 +45,13 @@ export interface SegmentMeta {
    * original filename, preserving its sort position among siblings.
    */
   splitOriginalPath?: string;
+  /**
+   * Timestamp appended as a query parameter to local-file:// URLs to bust
+   * Chromium's in-memory image decode cache. Set by loadSegmentMetadata after
+   * each process or split run. Without this, re-processed segments at the same
+   * path would show stale thumbnails and dimensions.
+   */
+  cacheKey?: number;
 }
 
 /**
@@ -56,8 +63,15 @@ export interface SegmentMeta {
  * first path component (e.g., "Users") as the hostname, producing a
  * truncated pathname.
  *
+ * @param cacheKey Optional timestamp to append as `?v=<cacheKey>`. Forces
+ *   Chromium to treat the URL as a new resource, bypassing the in-memory
+ *   image decode cache. The protocol handler uses `url.pathname` only, so
+ *   the query parameter is ignored server-side.
+ *
  * Example: /Users/foo/segment.png → local-file://localhost/Users/foo/segment.png
+ *          with cacheKey 123       → local-file://localhost/Users/foo/segment.png?v=123
  */
-export function toLocalFileUrl(absolutePath: string): string {
-  return `local-file://localhost${absolutePath}`;
+export function toLocalFileUrl(absolutePath: string, cacheKey?: number): string {
+  const base = `local-file://localhost${absolutePath}`;
+  return cacheKey != null ? `${base}?v=${cacheKey}` : base;
 }

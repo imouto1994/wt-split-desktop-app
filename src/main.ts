@@ -133,6 +133,10 @@ app.whenReady().then(async () => {
       return new Response(data, {
         headers: {
           "Content-Type": MIME_TYPES[ext] || "application/octet-stream",
+          // Prevent Chromium's HTTP cache from storing responses. Without this,
+          // re-processed segment files (same path, new content) would show stale
+          // images and dimensions in the renderer.
+          "Cache-Control": "no-store",
         },
       });
     });

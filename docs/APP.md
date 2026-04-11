@@ -55,7 +55,7 @@ src/
     index.tsx                 # Main page: webtoon processor UI
   components/
     webtoon/
-      types.ts                # SegmentMeta (paths, dimensions, splitGroup, gap colors, edge strips) + toLocalFileUrl
+      types.ts                # SegmentMeta (paths, dimensions, splitGroup, gap colors, edge strips, cacheKey) + toLocalFileUrl
       folder-picker.tsx       # Button + path display
       status-display.tsx      # Colored status text
       segment-list.tsx        # Ordered list of segment paths and heights
@@ -233,7 +233,7 @@ protocol.registerSchemesAsPrivileged([{
 }]);
 ```
 
-**Handler** (inside `app.whenReady`): reads the file directly with `fs.promises.readFile` and returns a `Response` with the correct MIME type:
+**Handler** (inside `app.whenReady`): reads the file directly with `fs.promises.readFile` and returns a `Response` with the correct MIME type and `Cache-Control: no-store` to prevent Chromium from serving stale content after files are overwritten:
 
 ```typescript
 protocol.handle("local-file", async (request) => {
@@ -242,12 +242,17 @@ protocol.handle("local-file", async (request) => {
   const data = await fs.promises.readFile(filePath);
   const ext = path.extname(filePath).toLowerCase();
   return new Response(data, {
-    headers: { "Content-Type": MIME_TYPES[ext] || "application/octet-stream" },
+    headers: {
+      "Content-Type": MIME_TYPES[ext] || "application/octet-stream",
+      "Cache-Control": "no-store",
+    },
   });
 });
 ```
 
 **URL format**: `local-file://localhost/absolute/path/to/file.png`. The explicit `localhost` host is required because registering as a `standard` scheme causes Chromium to parse the first path component after `://` as the hostname. Without `localhost`, a path like `/Users/nhanbui/...` would have `Users` eaten as the hostname.
+
+**Cache busting**: When segment files are overwritten at the same path (e.g. re-processing with different parameters), Chromium's in-memory image decode cache can serve stale bitmaps even with `Cache-Control: no-store`. To address this, `toLocalFileUrl(path, cacheKey)` appends an optional `?v=<timestamp>` query parameter. The protocol handler uses `url.pathname` only, so the query is ignored server-side. `loadSegmentMetadata` sets `cacheKey = Date.now()` on each batch, and all image-rendering components (`SegmentGrid`, `SplitEditorModal`) pass `seg.cacheKey` to `toLocalFileUrl`.
 
 **Used for**: grid thumbnails, editor preview, and `new Image()` dimension loading.
 
@@ -266,9 +271,9 @@ Bridges a `MessagePort` from the renderer to the main process for the oRPC conne
 ### Renderer UI
 
 - **`src/routes/index.tsx`**: Single page with folder pickers, processing parameters, process button, status display, segment list, segment grid, split editor modal, and staged editing controls (Confirm/Discard).
-- **`SegmentMeta`** (`src/components/webtoon/types.ts`): Renderer segment state includes `topGapColor`, `bottomGapColor`, `topEdgeStrip`, `bottomEdgeStrip` (all `string | null`) alongside path, dimensions, and optional `splitGroup`.
+- **`SegmentMeta`** (`src/components/webtoon/types.ts`): Renderer segment state includes `topGapColor`, `bottomGapColor`, `topEdgeStrip`, `bottomEdgeStrip` (all `string | null`) alongside path, dimensions, optional `splitGroup`, and optional `cacheKey` (timestamp for image URL cache busting).
 - **State**: Core state (`inputDir`, `outputDir`, `minGapHeight`, `colorTolerance`), staging state (`baseSegments`, `segments`, `hiddenPaths`, `replacedSegments`, `createdBySplitFiles`), UI state (`statusMessage`, `statusMode`, `isProcessing`, `isCommitting`, `editingSegment`). Derived: `hasPendingChanges`, `visibleSegments`.
-- **`loadSegmentMetadata`**: Creates `new Image()` elements with `local-file://localhost/...` URLs to read `naturalWidth`/`naturalHeight` for each segment. Accepts an optional `splitGroup` tag to assign to the resulting metas.
+- **`loadSegmentMetadata`**: Creates `new Image()` elements with cache-busted `local-file://localhost/...?v=<timestamp>` URLs to read `naturalWidth`/`naturalHeight` for each segment. Sets a shared `cacheKey` (via `Date.now()`) on all resulting metas so grid and editor `<img>` elements also bypass the decode cache. Accepts an optional `splitGroup` tag to assign to the resulting metas.
 - **Sorting**: Segments are always sorted by path with `localeCompare({ numeric: true, sensitivity: "base" })`.
 
 ---

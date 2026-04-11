@@ -65,6 +65,9 @@ function loadSegmentMetadata(
     }[];
   },
 ): Promise<SegmentMeta[]> {
+  // Shared timestamp for this batch — all segments from one load share the
+  // same cache key so lazy-loaded images stay consistent within a run.
+  const cacheKey = Date.now();
   return Promise.all(
     files.map(
       (file, i) =>
@@ -85,6 +88,7 @@ function loadSegmentMetadata(
               bottomEdgeStripIsLight: strips?.bottomEdgeStripIsLight ?? null,
               splitGroup: opts?.splitGroup,
               splitOriginalPath: opts?.splitOriginalPath,
+              cacheKey,
             });
           // Resolve with zero dimensions on error so the UI still renders
           // (the thumbnail will show a broken image icon).
@@ -101,8 +105,12 @@ function loadSegmentMetadata(
               bottomEdgeStripIsLight: strips?.bottomEdgeStripIsLight ?? null,
               splitGroup: opts?.splitGroup,
               splitOriginalPath: opts?.splitOriginalPath,
+              cacheKey,
             });
-          img.src = toLocalFileUrl(file);
+          // Cache-busted URL ensures Chromium's image decode cache does not
+          // serve stale bitmaps when files at the same path are overwritten
+          // (e.g. after re-processing with different parameters).
+          img.src = toLocalFileUrl(file, cacheKey);
         }),
     ),
   );
@@ -122,6 +130,9 @@ function sortSegments(segs: SegmentMeta[]): SegmentMeta[] {
  * Strips staging metadata (splitGroup, splitOriginalPath) from segments
  * when they become the new base after Confirm. Committed segments are
  * no longer undoable, so these fields would be misleading.
+ *
+ * Note: cacheKey is intentionally preserved in `...rest` — committed
+ * segments should keep their cache version so thumbnails stay valid.
  */
 function stripStagingFields(segs: SegmentMeta[]): SegmentMeta[] {
   return segs.map(({ splitGroup, splitOriginalPath, ...rest }) => rest);

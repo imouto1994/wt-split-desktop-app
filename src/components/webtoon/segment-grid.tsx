@@ -66,7 +66,7 @@ export default function SegmentGrid({
           >
             <img
               loading="lazy"
-              src={toLocalFileUrl(seg.path)}
+              src={toLocalFileUrl(seg.path, seg.cacheKey)}
               alt={`Segment ${idx}`}
               className="block w-full"
             />

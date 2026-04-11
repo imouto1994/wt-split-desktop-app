@@ -225,7 +225,7 @@ export default function SplitEditorModal({
         >
           <img
             ref={imageRef}
-            src={toLocalFileUrl(segment.path)}
+            src={toLocalFileUrl(segment.path, segment.cacheKey)}
             alt="Segment preview"
             className="block h-auto w-full"
             onLoad={handleImageLoad}
