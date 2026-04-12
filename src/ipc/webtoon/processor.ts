@@ -22,6 +22,7 @@ import {
   DEFAULT_COLOR_TOLERANCE,
   DEFAULT_MIN_GAP_HEIGHT,
 } from "@/constants";
+import type { ProgressInfo } from "@/constants";
 
 interface ProcessWebtoonInput {
   inputDir: string;
@@ -30,6 +31,11 @@ interface ProcessWebtoonInput {
   minGapHeight?: number;
   /** Override the default per-channel color tolerance for uniform row detection. */
   colorTolerance?: number;
+  /**
+   * Optional progress callback fired at pipeline stage transitions and after
+   * each segment write. Used by the handler to push IPC events to the renderer.
+   */
+  onProgress?: (info: ProgressInfo) => void;
 }
 
 interface SplitSegmentInput {
@@ -149,6 +155,7 @@ export async function processWebtoon({
   outputDir,
   minGapHeight,
   colorTolerance,
+  onProgress,
 }: ProcessWebtoonInput): Promise<ProcessedSegment[]> {
   const imagePaths = await readImagePaths(inputDir);
   if (!imagePaths.length) {
@@ -157,6 +164,7 @@ export async function processWebtoon({
 
   await resetOutputDir(outputDir);
 
+  onProgress?.({ stage: "stitching", detail: `${imagePaths.length} images` });
   const stitched = await createStitchedImage(imagePaths);
 
   // Materialize the composite to a PNG buffer, then re-open it.
@@ -164,6 +172,8 @@ export async function processWebtoon({
   // we attempt a raw pixel read, avoiding "no pixels" errors.
   const stitchedBuffer = await stitched.png().toBuffer();
   const stitchedSharp = sharp(stitchedBuffer);
+
+  onProgress?.({ stage: "analyzing" });
 
   // Extract raw RGBA pixel data for row-by-row gap analysis.
   // ensureAlpha() guarantees 4 channels even if the source was RGB.
@@ -190,7 +200,10 @@ export async function processWebtoon({
     slices,
     outputDir,
     info.width,
+    onProgress,
   );
+
+  onProgress?.({ stage: "finalizing" });
 
   // Build ProcessedSegment results pairing file paths with gap colors.
   // Interior auto-split segments have proper gap colors from the removed
@@ -547,6 +560,14 @@ function findUniformRowRuns(
  * color, guaranteeing an exact match in the web reader (solid gap, not
  * gradient). Mismatched colors only occur when segments from different gap
  * runs become adjacent (e.g., a segment was deleted in the web app).
+ *
+ * Adjacent gap merging: the cross-row consistency check in findUniformRowRuns
+ * can split a gradual-transition gap into multiple adjacent runs (no content
+ * rows between them). To prevent these from producing mismatched gap colors,
+ * `lastGap` is only updated when a content slice is actually emitted. A chain
+ * of adjacent gap runs all resolve to the first run's color, so both bounding
+ * segments get the same hex value. The color difference is negligible since
+ * adjacent runs are within tolerance of each other.
  */
 function buildSlicesFromRuns(
   runs: UniformRun[],
@@ -555,8 +576,11 @@ function buildSlicesFromRuns(
 ): Slice[] {
   const slices: Slice[] = [];
   let cursor = 0;
-  // Track the most recently skipped (removable) gap so we can assign its
-  // color as the next slice's topGapColor.
+  // Track the gap whose color should be assigned to the next content slice's
+  // topGapColor. Only updated when content is actually emitted between gaps,
+  // so a chain of adjacent gap runs (from the cross-row check splitting a
+  // single visual gap) all resolve to the first run's color — guaranteeing
+  // an exact match on both sides.
   let lastGap: UniformRun | null = null;
 
   for (const run of runs) {
@@ -573,9 +597,17 @@ function buildSlicesFromRuns(
         topGapColor: lastGap ? rgbToHex(lastGap.color) : null,
         bottomGapColor: rgbToHex(run.color),
       });
+      // Only update lastGap when content was emitted between gaps. When
+      // gap runs are directly adjacent (run.start === cursor), this is
+      // skipped so the next content slice gets the first run's color
+      // instead of the last — preventing cross-row-check-induced mismatches.
+      lastGap = run;
+    } else if (lastGap === null) {
+      // Leading gap at the image start (no content before it). Record it
+      // so the first content slice gets the correct topGapColor.
+      lastGap = run;
     }
-    lastGap = run;
-    // Advance cursor past the gap.
+    // Advance cursor past the gap (regardless of whether content was emitted).
     cursor = run.end;
   }
 
@@ -598,8 +630,12 @@ async function writeSlices(
   slices: Slice[],
   dir: string,
   width: number,
+  onProgress?: (info: ProgressInfo) => void,
 ): Promise<string[]> {
   const files: string[] = [];
+  // Pre-count valid slices so the progress total matches the actual output
+  // count (slices with height <= 0 are skipped).
+  const totalValid = slices.filter((s) => s.height > 0).length;
   let index = 0;
   for (const slice of slices) {
     if (slice.height <= 0) {
@@ -615,6 +651,14 @@ async function writeSlices(
       .toFile(outPath);
     files.push(outPath);
     index += 1;
+    // Report after each write so `current` reflects completed work.
+    // Fires between awaits, giving the event loop time to flush the IPC send.
+    onProgress?.({
+      stage: "writing",
+      current: index,
+      total: totalValid,
+      detail: filename,
+    });
   }
   return files;
 }

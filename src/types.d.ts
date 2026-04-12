@@ -3,3 +3,16 @@
 // whether you're running in development or production).
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string;
 declare const MAIN_WINDOW_VITE_NAME: string;
+
+// Electron contextBridge API exposed by preload.ts.
+// Uses import() type to reference ProgressInfo without turning this file into a module.
+interface ElectronAPI {
+  /** Subscribe to processing progress events; returns a cleanup function. */
+  onProcessingProgress: (
+    callback: (info: import("./constants").ProgressInfo) => void,
+  ) => () => void;
+}
+
+interface Window {
+  electronAPI: ElectronAPI;
+}

@@ -17,6 +17,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { os } from "@orpc/server";
 import { dialog, shell } from "electron";
+import { IPC_CHANNELS } from "@/constants";
 import { ipcContext } from "../context";
 import {
   deleteFilesInputSchema,
@@ -66,10 +67,16 @@ export const pickOutput = os
  * the admin selects the parent folder and each `[Toonwide] *` sub-folder
  * becomes an importable chapter.
  * Returns per-segment metadata including gap colors from removed strips.
+ *
+ * Uses mainWindowContext to push stage-aware progress events (stitching,
+ * analyzing, writing, finalizing) to the renderer via Electron IPC,
+ * separate from the oRPC request/response channel which doesn't support
+ * streaming.
  */
 export const processWebtoon = os
+  .use(ipcContext.mainWindowContext)
   .input(processWebtoonInputSchema)
-  .handler(async ({ input }) => {
+  .handler(async ({ input, context }) => {
     const { inputDir, outputDir, minGapHeight, colorTolerance } = input;
     if (!inputDir) throw new Error("Input directory is required.");
     const finalOutput =
@@ -80,6 +87,16 @@ export const processWebtoon = os
       outputDir: finalOutput,
       minGapHeight,
       colorTolerance,
+      onProgress: (info) => {
+        // Guard: the window may be closed while processing is in-flight.
+        // webContents.send on a destroyed window throws.
+        if (!context.window.isDestroyed()) {
+          context.window.webContents.send(
+            IPC_CHANNELS.PROCESSING_PROGRESS,
+            info,
+          );
+        }
+      },
     });
     return { outputDir: finalOutput, segments };
   });

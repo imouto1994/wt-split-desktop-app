@@ -5,7 +5,33 @@ export const LOCAL_STORAGE_KEYS = {
 
 export const IPC_CHANNELS = {
   START_ORPC_SERVER: "start-orpc-server",
+  /** Push channel for stage-aware processing progress from main → renderer. */
+  PROCESSING_PROGRESS: "processing-progress",
 };
+
+/**
+ * Processing pipeline stage names used by the onProgress callback.
+ * Shared across main (processor), preload (contextBridge), and renderer.
+ */
+export type ProgressStage =
+  | "stitching"
+  | "analyzing"
+  | "writing"
+  | "finalizing";
+
+/**
+ * Progress update payload sent from the processor → handler → renderer
+ * during the processWebtoon pipeline via Electron IPC events.
+ */
+export interface ProgressInfo {
+  stage: ProgressStage;
+  /** 1-based index of the current segment being written (only for "writing" stage). */
+  current?: number;
+  /** Total number of segments to write (only for "writing" stage). */
+  total?: number;
+  /** Extra context string, e.g. filename or image count. */
+  detail?: string;
+}
 
 export const ENVIRONMENT_VARIABLES = {
   NODE_ENV: process.env.NODE_ENV,

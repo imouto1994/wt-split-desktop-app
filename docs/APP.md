@@ -28,10 +28,10 @@ This app is a rebuild of the earlier VanillaJS prototype (`webtoon-prototype/ele
 ```
 src/
   main.ts                     # App lifecycle, BrowserWindow, custom protocol, oRPC setup
-  preload.ts                  # MessagePort bridge for oRPC
+  preload.ts                  # MessagePort bridge for oRPC + contextBridge API (processing progress)
   renderer.ts                 # Entry point → imports app.tsx
   app.tsx                     # React root, RouterProvider, theme/language sync
-  constants/index.ts          # IPC channel names, env vars, feature flags, processing defaults
+  constants/index.ts          # IPC channel names, env vars, feature flags, processing defaults, ProgressInfo type
   ipc/
     handler.ts                # RPCHandler wrapping the router
     manager.ts                # Renderer-side oRPC client (IPCManager)
@@ -58,7 +58,6 @@ src/
       types.ts                # SegmentMeta (paths, dimensions, splitGroup, gap colors, edge strips, cacheKey) + toLocalFileUrl
       folder-picker.tsx       # Button + path display
       status-display.tsx      # Colored status text
-      segment-list.tsx        # Ordered list of segment paths and heights
       segment-grid.tsx        # Responsive thumbnail grid with Open / Edit / Hide / Undo
       split-editor-modal.tsx  # Multi-line split editor modal
     ui/                       # shadcn/ui primitives (button, toggle, etc.)
@@ -122,6 +121,7 @@ npm run make
 3. A row is "uniform" if every pixel matches the **center pixel** (x = width/2) within `colorTolerance` per channel (R, G, B, A). The center pixel is used instead of x=0 to avoid edge artifacts from the stitching/resizing pipeline and to minimize the maximum distance to any pixel in the row.
 4. **Cross-row consistency**: contiguous uniform rows are grouped into a "run" only if each row's center pixel also matches the **run's reference color** (the first row's center pixel) within tolerance. This prevents color drift across a run and stops thin border rows (a different uniform color at a gap edge) from being absorbed into the gap.
 5. Each run's representative color is sampled from the **center row** (y-midpoint) of the run, then **snapped to pure white (#ffffff) or pure black (#000000)** if within tolerance. Using a single color per run (instead of separate top/bottom row colors) guarantees that two segments separated by the same gap always receive the exact same hex value, producing a clean solid gap in the web reader.
+6. **Adjacent gap merging**: When the cross-row check splits a gradual-transition gap into multiple adjacent runs (no content rows between them), they are treated as one logical gap — the first run's color is used for both bounding segments. This prevents color mismatches that would otherwise trigger gradient rendering in the web reader.
 
 **Processing parameters** (user-configurable via the UI, with defaults in `src/constants/index.ts`):
 
@@ -155,10 +155,9 @@ The user can override these per-run in the "Processing Settings" area of the con
 - If any children were hidden, they are auto-unhidden when the split is undone.
 - **Gap colors after merge**: The merged segment’s `topGapColor` comes from the **first** child’s `topGapColor`, and `bottomGapColor` from the **last** child’s `bottomGapColor`. After merge, **`writeMetadata`** updates `metadata.json` for the output directory.
 
-### Preview & Listing
+### Preview
 
-- **List**: Shows each absolute path and decoded height (px) for **visible segments only** (hidden segments are excluded from the list view).
-- **Grid**: Lazy-loaded thumbnails via `local-file://localhost/...` protocol, index + height. Shows **all** segments including hidden ones (dimmed at `opacity-40`). A dynamic summary ("N visible / M total") is shown in the section header.
+- **Grid**: Lazy-loaded thumbnails via `local-file://localhost/...` protocol, index + height + gap color swatches with hex labels. Shows **all** segments including hidden ones (dimmed at `opacity-40`). A dynamic summary ("N visible / M total") is shown in the section header.
 - **Open**: Calls `shell.showItemInFolder()` to reveal the file in the OS file manager (Finder / Explorer). Disabled on hidden segments.
 - **Edit**: Opens the multi-line split editor. Available on **all** segments — amber button for recommended splits (ratio > 3), outline button for optional splits. Disabled on hidden segments.
 - **Hide / Unhide**: Toggles segment visibility for the staged editing workflow.
@@ -201,21 +200,21 @@ Aggregates all handler namespaces:
 |---------|-------------|
 | `pickInput` | `dialog.showOpenDialog(window, { properties: ["openDirectory"] })` — returns path or null |
 | `pickOutput` | `dialog.showOpenDialog(window, { properties: ["openDirectory", "createDirectory"] })` — returns path or null |
-| `processWebtoon` | Takes `{ inputDir, outputDir?, minGapHeight?, colorTolerance? }`. If `outputDir` is omitted, resolves it to `<parentDir>/[Toonwide] <inputDirName>` (sibling of the input); forwards processing params to `processor.processWebtoon()`, returns `{ outputDir, segments }` (each segment includes path + gap colors) |
+| `processWebtoon` | Takes `{ inputDir, outputDir?, minGapHeight?, colorTolerance? }`. If `outputDir` is omitted, resolves it to `<parentDir>/[Toonwide] <inputDirName>` (sibling of the input); forwards processing params to `processor.processWebtoon()`, returns `{ outputDir, segments }` (each segment includes path + gap colors). Uses `mainWindowContext` middleware to push stage-aware progress events (`stitching`, `analyzing`, `writing`, `finalizing`) to the renderer via `webContents.send(PROCESSING_PROGRESS)` — separate from the oRPC response. |
 | `writeMetadata` | Takes `{ outputDir, segments: { filename, topGapColor, bottomGapColor, topEdgeStrip?, bottomEdgeStrip? }[] }`, writes or overwrites `metadata.json` in that directory (called on Confirm to finalize staged edits) |
 | `splitSegment` | Takes `{ filePath, breakpoints: number[], keepOriginal?: boolean }`, calls `processor.splitSegment()`, returns `{ files, edgeStrips }` (N+1 paths + per-sub-segment edge strip data URIs). When `keepOriginal` is true, the original file is preserved for staged undo. |
 | `mergeSegments` | Takes `{ filePaths, outputPath }`, calls `processor.mergeSegments()`, returns `{ file }` (merged path). **Note:** No longer used by the staged undo flow (retained for potential future use). |
 | `deleteFiles` | Takes `{ filePaths: string[] }`, deletes each file via `fs.rm({ force: true })`. Returns `{ failed }` with paths that could not be deleted. Used by staged editing for Confirm, Discard, and undo-split cleanup. |
 | `showInFolder` | Calls `shell.showItemInFolder(filePath)` to reveal a file in the OS file manager |
 
-The `pickInput` and `pickOutput` handlers use the `ipcContext.mainWindowContext` middleware to attach the native dialog to the main `BrowserWindow`.
+The `pickInput`, `pickOutput`, and `processWebtoon` handlers use the `ipcContext.mainWindowContext` middleware to access the main `BrowserWindow`. Dialog handlers use it for modal sheet attachment; `processWebtoon` uses it to push progress events via `webContents.send`.
 
 ### Processor (`src/ipc/webtoon/processor.ts`)
 
 Pure Node/Sharp module with no Electron imports. Exports:
 
 - **Types**: `ProcessedSegment` (`{ filePath, topGapColor, bottomGapColor, topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`), `SegmentGapMeta` (gap + edge strip + brightness metadata for sidecar serialization), `EdgeStripData` (`{ topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`), `SplitSegmentResult` (`{ files, edgeStrips }`).
-- `processWebtoon({ inputDir, outputDir, minGapHeight?, colorTolerance? })` → `Promise<ProcessedSegment[]>` — writes segment WebP lossless files, captures **gap colors** (center-row color of each removed uniform strip, snapped to white/black when within tolerance) and writes **`metadata.json`** in the output directory. Edge strips are `null` for interior auto-split segments. The **first segment's top row** and **last segment's bottom row** get edge strips with brightness classification (`isLight`) for column boundary gap rendering. Processing params fall back to defaults from `src/constants/index.ts` when omitted.
+- `processWebtoon({ inputDir, outputDir, minGapHeight?, colorTolerance?, onProgress? })` → `Promise<ProcessedSegment[]>` — writes segment WebP lossless files, captures **gap colors** (center-row color of each removed uniform strip, snapped to white/black when within tolerance) and writes **`metadata.json`** in the output directory. Edge strips are `null` for interior auto-split segments. The **first segment's top row** and **last segment's bottom row** get edge strips with brightness classification (`isLight`) for column boundary gap rendering. Processing params fall back to defaults from `src/constants/index.ts` when omitted. The optional `onProgress` callback (typed as `(info: ProgressInfo) => void`) fires at each pipeline stage: `stitching` (with image count), `analyzing`, `writing` (with segment index/total/filename after each write), and `finalizing`.
 - `writeMetadataJson(outputDir, segments: ProcessedSegment[])` — writes or overwrites **`metadata.json`** from an array of `{ filename, topGapColor, bottomGapColor, topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`.
 - `splitSegment({ filePath, breakpoints, keepOriginal? })` → `Promise<SplitSegmentResult>` (N+1 file paths + per-sub-segment edge strip data URIs with brightness flags; deletes original unless `keepOriginal` is true). Edge strips are extracted at interior split boundaries as 1px-tall PNG data URIs for gradient gap rendering in the web reader. Each strip includes an `isLight` flag based on average perceived luminance (Rec. 601).
 - `mergeSegments({ filePaths, outputPath })` → `Promise<string>` (merged path; deletes inputs)
@@ -268,11 +267,14 @@ protocol.handle("local-file", async (request) => {
 
 ### Preload (`src/preload.ts`)
 
-Bridges a `MessagePort` from the renderer to the main process for the oRPC connection. Listens for `window` `message` events with `event.data === START_ORPC_SERVER` and forwards the port via `ipcRenderer.postMessage`.
+Two independent APIs:
+
+1. **oRPC MessagePort bridge**: Listens for `window` `message` events with `event.data === START_ORPC_SERVER` and forwards the port via `ipcRenderer.postMessage`.
+2. **`electronAPI` via `contextBridge`**: Exposes `onProcessingProgress(callback)` which subscribes to `PROCESSING_PROGRESS` IPC events from the main process and returns a cleanup function. This push channel is separate from oRPC (which is request/response only) and carries `ProgressInfo` payloads during the processWebtoon pipeline.
 
 ### Renderer UI
 
-- **`src/routes/index.tsx`**: Single page with folder pickers, processing parameters, process button, status display, segment list, segment grid, split editor modal, and staged editing controls (Confirm/Discard).
+- **`src/routes/index.tsx`**: Single page with folder pickers, processing parameters, process button, status display, segment grid, split editor modal, and staged editing controls (Confirm/Discard). During processing, the status display shows stage-aware progress ("Stitching 15 images…", "Writing segment 3 of 12…", etc.) via IPC events from the main process, replacing the previous static "Processing…" message.
 - **`SegmentMeta`** (`src/components/webtoon/types.ts`): Renderer segment state includes `topGapColor`, `bottomGapColor`, `topEdgeStrip`, `bottomEdgeStrip` (all `string | null`) alongside path, dimensions, optional `splitGroup`, and optional `cacheKey` (timestamp for image URL cache busting).
 - **State**: Core state (`inputDir`, `outputDir`, `minGapHeight`, `colorTolerance`), staging state (`baseSegments`, `segments`, `hiddenPaths`, `replacedSegments`, `createdBySplitFiles`), UI state (`statusMessage`, `statusMode`, `isProcessing`, `isCommitting`, `editingSegment`). Derived: `hasPendingChanges`, `visibleSegments`.
 - **`loadSegmentMetadata`**: Creates `new Image()` elements with cache-busted `local-file://localhost/...?v=<timestamp>` URLs to read `naturalWidth`/`naturalHeight` for each segment. Sets a shared `cacheKey` (via `Date.now()`) on all resulting metas so grid and editor `<img>` elements also bypass the decode cache. Accepts an optional `splitGroup` tag to assign to the resulting metas.
@@ -293,10 +295,12 @@ Bridges a `MessagePort` from the renderer to the main process for the oRPC conne
 
 ## Configuration Knobs
 
-Shared defaults in `src/constants/index.ts` (importable by both main process and renderer):
+Shared defaults and types in `src/constants/index.ts` (importable by main process, preload, and renderer):
 
 - `DEFAULT_MIN_GAP_HEIGHT = 50` — minimum height (px) of a uniform "gap" run to remove. Lowered from 100 because the cross-row consistency check excludes border rows, shrinking detected gaps. User-configurable per-run via the Processing Settings UI.
 - `DEFAULT_COLOR_TOLERANCE = 20` — per-channel tolerance for "single-color" row detection and cross-row consistency. Raised from 10 to handle compression artifacts; safe because the cross-row check prevents color drift. User-configurable per-run via the Processing Settings UI (range: 0–255).
+- `IPC_CHANNELS.PROCESSING_PROGRESS` — Electron IPC channel name for push-style processing progress events from main → renderer.
+- `ProgressInfo` — type for progress payloads: `{ stage: ProgressStage, current?, total?, detail? }`. Stages are `"stitching"`, `"analyzing"`, `"writing"`, `"finalizing"`. Shared across main (processor callback), preload (contextBridge), and renderer (subscription + type declaration in `types.d.ts`).
 
 Editable in `src/components/webtoon/segment-grid.tsx`:
 
@@ -343,7 +347,7 @@ This app originated as a port of `webtoon-prototype/electron/`. The core stitchi
 
 ## Security Notes
 
-- Context isolation is enabled; the preload only bridges a MessagePort for oRPC.
+- Context isolation is enabled; the preload bridges a MessagePort for oRPC and exposes a minimal `electronAPI` via `contextBridge` for processing progress events.
 - oRPC router exposes only whitelisted handler methods.
 - The `local-file://` protocol serves local files for previews; acceptable for a local tool. Do not expose this pattern to untrusted remote content.
 - Fuses are configured to enforce ASAR integrity, disable `NODE_OPTIONS`, and disable `RunAsNode`.

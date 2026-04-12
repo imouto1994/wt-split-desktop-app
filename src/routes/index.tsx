@@ -29,7 +29,6 @@ import {
 } from "@/actions/webtoon";
 import FolderPicker from "@/components/webtoon/folder-picker";
 import SegmentGrid from "@/components/webtoon/segment-grid";
-import SegmentList from "@/components/webtoon/segment-list";
 import SplitEditorModal from "@/components/webtoon/split-editor-modal";
 import StatusDisplay from "@/components/webtoon/status-display";
 import { type SegmentMeta, toLocalFileUrl } from "@/components/webtoon/types";
@@ -261,6 +260,27 @@ function HomePage() {
     clearStagingState();
     setIsProcessing(true);
 
+    // Subscribe to stage-aware progress events pushed from the main process
+    // via Electron IPC (separate from the oRPC request/response channel).
+    const unsubscribe = window.electronAPI.onProcessingProgress((info) => {
+      switch (info.stage) {
+        case "stitching":
+          setStatus(`Stitching ${info.detail}\u2026`);
+          break;
+        case "analyzing":
+          setStatus("Analyzing gaps\u2026");
+          break;
+        case "writing":
+          setStatus(
+            `Writing segment ${info.current} of ${info.total}\u2026`,
+          );
+          break;
+        case "finalizing":
+          setStatus("Finalizing\u2026");
+          break;
+      }
+    });
+
     try {
       const res = await processWebtoon({
         inputDir,
@@ -297,6 +317,7 @@ function HomePage() {
       const message = err instanceof Error ? err.message : String(err);
       setStatus(`Error: ${message}`, "error");
     } finally {
+      unsubscribe();
       setIsProcessing(false);
     }
   }, [inputDir, outputDir, minGapHeight, colorTolerance, setStatus, hasPendingChanges, createdBySplitFiles, clearStagingState]);
@@ -681,7 +702,7 @@ function HomePage() {
         </div>
       </section>
 
-      {/* Results section: segment list + thumbnail grid + confirm/discard */}
+      {/* Results section: thumbnail grid + confirm/discard */}
       <section className="rounded-xl border border-border bg-card p-4 shadow-lg">
         <div className="mb-2 flex items-center justify-between">
           <h2 className="font-bold text-lg">Generated Segments</h2>
@@ -696,19 +717,15 @@ function HomePage() {
             {resultSummary}
           </div>
         )}
-        {/* SegmentList shows only visible segments (the "output" view) */}
-        <SegmentList segments={visibleSegments} />
-        <div className="mt-3">
-          <SegmentGrid
-            segments={segments}
-            hiddenPaths={hiddenPaths}
-            onEdit={handleEdit}
-            onHide={handleHide}
-            onUnhide={handleUnhide}
-            onUndoSplit={handleUndoSplit}
-            isDisabled={isBusy}
-          />
-        </div>
+        <SegmentGrid
+          segments={segments}
+          hiddenPaths={hiddenPaths}
+          onEdit={handleEdit}
+          onHide={handleHide}
+          onUnhide={handleUnhide}
+          onUndoSplit={handleUndoSplit}
+          isDisabled={isBusy}
+        />
 
         {/* Confirm / Discard bar — only when there are staged changes */}
         {hasPendingChanges && (

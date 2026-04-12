@@ -134,6 +134,9 @@ export default function SegmentGrid({
                         className="inline-block size-3 rounded-sm border border-border"
                         style={{ backgroundColor: seg.topGapColor }}
                       />
+                      <span className="font-mono text-muted-foreground">
+                        {seg.topGapColor}
+                      </span>
                     </span>
                   )}
                   {seg.bottomGapColor && (
@@ -143,6 +146,9 @@ export default function SegmentGrid({
                         className="inline-block size-3 rounded-sm border border-border"
                         style={{ backgroundColor: seg.bottomGapColor }}
                       />
+                      <span className="font-mono text-muted-foreground">
+                        {seg.bottomGapColor}
+                      </span>
                     </span>
                   )}
                 </div>
