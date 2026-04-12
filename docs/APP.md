@@ -119,12 +119,14 @@ npm run make
 
 1. The stitched image is rendered to a PNG buffer, then re-opened as a Sharp pipeline.
 2. Raw RGBA pixels are scanned row-by-row.
-3. A row is "uniform" if every pixel matches the first pixel within `colorTolerance` per channel (R, G, B, A).
+3. A row is "uniform" if every pixel matches the **center pixel** (x = width/2) within `colorTolerance` per channel (R, G, B, A). The center pixel is used instead of x=0 to avoid edge artifacts from the stitching/resizing pipeline and to minimize the maximum distance to any pixel in the row.
+4. **Cross-row consistency**: contiguous uniform rows are grouped into a "run" only if each row's center pixel also matches the **run's reference color** (the first row's center pixel) within tolerance. This prevents color drift across a run and stops thin border rows (a different uniform color at a gap edge) from being absorbed into the gap.
+5. Each run's representative color is sampled from the **center row** (y-midpoint) of the run, then **snapped to pure white (#ffffff) or pure black (#000000)** if within tolerance. Using a single color per run (instead of separate top/bottom row colors) guarantees that two segments separated by the same gap always receive the exact same hex value, producing a clean solid gap in the web reader.
 
 **Processing parameters** (user-configurable via the UI, with defaults in `src/constants/index.ts`):
 
-- `DEFAULT_COLOR_TOLERANCE = 10` — per-channel tolerance for "single-color" row detection. Range: 0–255.
-- `DEFAULT_MIN_GAP_HEIGHT = 100` — contiguous runs of uniform rows at least this tall are treated as removable gaps; content between those runs becomes segments.
+- `DEFAULT_COLOR_TOLERANCE = 20` — per-channel tolerance for "single-color" row detection. Range: 0–255. Also governs the cross-row consistency check and the white/black snap threshold.
+- `DEFAULT_MIN_GAP_HEIGHT = 50` — contiguous runs of uniform rows at least this tall are treated as removable gaps; content between those runs becomes segments. Lowered from 100 because the cross-row check excludes border rows from gap runs (shrinking detected gaps) and 50px catches more real panel gaps.
 
 The user can override these per-run in the "Processing Settings" area of the controls card. Empty fields fall back to the defaults. The values are session-only (reset on app restart).
 
@@ -213,12 +215,12 @@ The `pickInput` and `pickOutput` handlers use the `ipcContext.mainWindowContext`
 Pure Node/Sharp module with no Electron imports. Exports:
 
 - **Types**: `ProcessedSegment` (`{ filePath, topGapColor, bottomGapColor, topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`), `SegmentGapMeta` (gap + edge strip + brightness metadata for sidecar serialization), `EdgeStripData` (`{ topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`), `SplitSegmentResult` (`{ files, edgeStrips }`).
-- `processWebtoon({ inputDir, outputDir, minGapHeight?, colorTolerance? })` → `Promise<ProcessedSegment[]>` — writes segment WebP lossless files, captures **top/bottom gap colors** from removed uniform strips, and writes **`metadata.json`** in the output directory. Edge strips are `null` for interior auto-split segments. The **first segment's top row** and **last segment's bottom row** get edge strips with brightness classification (`isLight`) for column boundary gap rendering. Processing params fall back to defaults from `src/constants/index.ts` when omitted.
+- `processWebtoon({ inputDir, outputDir, minGapHeight?, colorTolerance? })` → `Promise<ProcessedSegment[]>` — writes segment WebP lossless files, captures **gap colors** (center-row color of each removed uniform strip, snapped to white/black when within tolerance) and writes **`metadata.json`** in the output directory. Edge strips are `null` for interior auto-split segments. The **first segment's top row** and **last segment's bottom row** get edge strips with brightness classification (`isLight`) for column boundary gap rendering. Processing params fall back to defaults from `src/constants/index.ts` when omitted.
 - `writeMetadataJson(outputDir, segments: ProcessedSegment[])` — writes or overwrites **`metadata.json`** from an array of `{ filename, topGapColor, bottomGapColor, topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`.
 - `splitSegment({ filePath, breakpoints, keepOriginal? })` → `Promise<SplitSegmentResult>` (N+1 file paths + per-sub-segment edge strip data URIs with brightness flags; deletes original unless `keepOriginal` is true). Edge strips are extracted at interior split boundaries as 1px-tall PNG data URIs for gradient gap rendering in the web reader. Each strip includes an `isLight` flag based on average perceived luminance (Rec. 601).
 - `mergeSegments({ filePaths, outputPath })` → `Promise<string>` (merged path; deletes inputs)
 
-Internal helpers: `readImagePaths`, `resetOutputDir`, `createStitchedImage`, `findUniformRowRuns`, `buildSlicesFromRuns`, `writeSlices`, `isUniformRow`, `extractEdgeStrip`.
+Internal helpers: `readImagePaths`, `resetOutputDir`, `createStitchedImage`, `findUniformRowRuns`, `buildSlicesFromRuns`, `writeSlices`, `isUniformRow`, `getRowColor`, `isColorWithinTolerance`, `snapToCanonicalColor`, `pushRun`, `extractEdgeStrip`.
 
 ### Custom Protocol (`local-file://`)
 
@@ -293,8 +295,8 @@ Bridges a `MessagePort` from the renderer to the main process for the oRPC conne
 
 Shared defaults in `src/constants/index.ts` (importable by both main process and renderer):
 
-- `DEFAULT_MIN_GAP_HEIGHT = 100` — minimum height (px) of a uniform "gap" run to remove. User-configurable per-run via the Processing Settings UI.
-- `DEFAULT_COLOR_TOLERANCE = 10` — per-channel tolerance for "single-color" row detection. User-configurable per-run via the Processing Settings UI (range: 0–255).
+- `DEFAULT_MIN_GAP_HEIGHT = 50` — minimum height (px) of a uniform "gap" run to remove. Lowered from 100 because the cross-row consistency check excludes border rows, shrinking detected gaps. User-configurable per-run via the Processing Settings UI.
+- `DEFAULT_COLOR_TOLERANCE = 20` — per-channel tolerance for "single-color" row detection and cross-row consistency. Raised from 10 to handle compression artifacts; safe because the cross-row check prevents color drift. User-configurable per-run via the Processing Settings UI (range: 0–255).
 
 Editable in `src/components/webtoon/segment-grid.tsx`:
 

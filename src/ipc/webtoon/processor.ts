@@ -9,7 +9,7 @@
  *   2. Stitch them into one tall vertical strip (handling EXIF orientation)
  *   3. Scan the strip row-by-row to find large uniform-color gaps
  *   4. Split at the gaps to produce individual WebP lossless segments
- *   5. Capture gap colors (top/bottom of each removed strip) per segment
+ *   5. Capture gap colors (center-row color of each removed strip) per segment
  *   6. Write a metadata.json sidecar with gap color info for the web app
  *   7. Optionally, manually split/merge segments after the fact
  *   8. Edge strips: manual splits extract 1px-tall PNG data URIs at interior
@@ -72,10 +72,14 @@ interface RgbColor {
 interface UniformRun {
   start: number;
   end: number;
-  /** Color of the first row in the run (reference pixel). */
-  topColor: RgbColor;
-  /** Color of the last row in the run (reference pixel). */
-  bottomColor: RgbColor;
+  /**
+   * Representative color sampled from the center row of the run, then
+   * snapped to pure white/black if within tolerance. Using a single color
+   * (instead of separate top/bottom) guarantees that two segments from the
+   * same removed gap always get the exact same hex string, producing a
+   * clean solid gap in the web reader.
+   */
+  color: RgbColor;
 }
 
 /**
@@ -480,9 +484,13 @@ async function createStitchedImage(
 /**
  * findUniformRowRuns scans raw RGBA pixel data row-by-row and identifies
  * contiguous vertical runs where every row is "uniform" (single-color within
- * tolerance). Returns an array of { start, end, topColor, bottomColor } row
- * ranges, where topColor/bottomColor are the reference pixel of the first
- * and last rows of each run (used for gap coloring in the reader).
+ * tolerance). Each run carries a single representative color sampled from its
+ * center row (snapped to pure white/black when within tolerance).
+ *
+ * Cross-row consistency: a row is only added to the current run if its center
+ * pixel also matches the run's reference color (first row's center pixel)
+ * within tolerance. This prevents color drift across a run and stops thin
+ * border rows (different color at the gap edge) from being absorbed.
  */
 function findUniformRowRuns(
   data: Buffer,
@@ -492,31 +500,35 @@ function findUniformRowRuns(
 ): UniformRun[] {
   const runs: UniformRun[] = [];
   let runStart = -1;
+  let runRefColor: RgbColor | null = null;
 
   for (let y = 0; y < height; y += 1) {
     const uniform = isUniformRow(data, width, y, tolerance);
-    if (uniform && runStart === -1) {
-      runStart = y;
-    }
-    if (!uniform && runStart !== -1) {
-      runs.push({
-        start: runStart,
-        end: y,
-        topColor: getRowColor(data, width, runStart),
-        bottomColor: getRowColor(data, width, y - 1),
-      });
+
+    if (uniform) {
+      const rowColor = getRowColor(data, width, y);
+
+      if (runStart === -1) {
+        runStart = y;
+        runRefColor = rowColor;
+      } else if (!isColorWithinTolerance(rowColor, runRefColor!, tolerance)) {
+        // Row is uniform within itself but drifted from the run's reference
+        // color — end the current run and start a fresh one from this row.
+        pushRun(runs, data, width, runStart, y, tolerance);
+        runStart = y;
+        runRefColor = rowColor;
+      }
+      // Otherwise the row is uniform AND consistent with the run — continue.
+    } else if (runStart !== -1) {
+      pushRun(runs, data, width, runStart, y, tolerance);
       runStart = -1;
+      runRefColor = null;
     }
   }
 
   // Handle a run that extends to the bottom edge of the image.
   if (runStart !== -1) {
-    runs.push({
-      start: runStart,
-      end: height,
-      topColor: getRowColor(data, width, runStart),
-      bottomColor: getRowColor(data, width, height - 1),
-    });
+    pushRun(runs, data, width, runStart, height, tolerance);
   }
 
   return runs;
@@ -530,11 +542,11 @@ function findUniformRowRuns(
  * Content between (and after) those gaps becomes output slices.
  * Short uniform runs are absorbed into the surrounding content.
  *
- * For each slice, topGapColor is the bottom-row color of the preceding gap
- * (the row closest to this slice's top edge), and bottomGapColor is the
- * top-row color of the following gap (the row closest to this slice's
- * bottom edge). These are stored so the web reader can render the original
- * gap color between adjacent segments.
+ * Each run carries a single representative color (center row, snapped to
+ * white/black). Both the slice above and below a gap receive the same hex
+ * color, guaranteeing an exact match in the web reader (solid gap, not
+ * gradient). Mismatched colors only occur when segments from different gap
+ * runs become adjacent (e.g., a segment was deleted in the web app).
  */
 function buildSlicesFromRuns(
   runs: UniformRun[],
@@ -544,7 +556,7 @@ function buildSlicesFromRuns(
   const slices: Slice[] = [];
   let cursor = 0;
   // Track the most recently skipped (removable) gap so we can assign its
-  // bottomColor as the next slice's topGapColor.
+  // color as the next slice's topGapColor.
   let lastGap: UniformRun | null = null;
 
   for (const run of runs) {
@@ -558,9 +570,8 @@ function buildSlicesFromRuns(
       slices.push({
         top: cursor,
         height: run.start - cursor,
-        topGapColor: lastGap ? rgbToHex(lastGap.bottomColor) : null,
-        // bottomGapColor will be filled in by the next gap (or left null).
-        bottomGapColor: rgbToHex(run.topColor),
+        topGapColor: lastGap ? rgbToHex(lastGap.color) : null,
+        bottomGapColor: rgbToHex(run.color),
       });
     }
     lastGap = run;
@@ -573,7 +584,7 @@ function buildSlicesFromRuns(
     slices.push({
       top: cursor,
       height: imageHeight - cursor,
-      topGapColor: lastGap ? rgbToHex(lastGap.bottomColor) : null,
+      topGapColor: lastGap ? rgbToHex(lastGap.color) : null,
       bottomGapColor: null,
     });
   }
@@ -609,12 +620,61 @@ async function writeSlices(
 }
 
 /**
- * Extracts the RGB color of the first pixel in a given row.
- * Used to capture the reference color of gap boundaries.
+ * Extracts the RGB color of the center pixel in a given row.
+ * The center pixel (x = width/2) is used instead of x=0 because the image
+ * edges are more susceptible to resizing/compositing artifacts from the
+ * stitching pipeline.
  */
 function getRowColor(data: Buffer, width: number, rowIndex: number): RgbColor {
-  const offset = rowIndex * width * 4;
+  const offset = (rowIndex * width + Math.floor(width / 2)) * 4;
   return { r: data[offset], g: data[offset + 1], b: data[offset + 2] };
+}
+
+/** Checks whether two RGB colors differ by at most `tolerance` on every channel. */
+function isColorWithinTolerance(
+  a: RgbColor,
+  b: RgbColor,
+  tolerance: number,
+): boolean {
+  return (
+    Math.abs(a.r - b.r) <= tolerance &&
+    Math.abs(a.g - b.g) <= tolerance &&
+    Math.abs(a.b - b.b) <= tolerance
+  );
+}
+
+const WHITE: RgbColor = { r: 255, g: 255, b: 255 };
+const BLACK: RgbColor = { r: 0, g: 0, b: 0 };
+
+/**
+ * Snaps a color to pure white or pure black when it falls within tolerance
+ * of either. Most comic gaps are white or black; this eliminates near-miss
+ * hex values like #fafafa that look indistinguishable from #ffffff.
+ */
+function snapToCanonicalColor(color: RgbColor, tolerance: number): RgbColor {
+  if (isColorWithinTolerance(color, WHITE, tolerance)) return WHITE;
+  if (isColorWithinTolerance(color, BLACK, tolerance)) return BLACK;
+  return color;
+}
+
+/**
+ * Pushes a completed uniform run onto the array. Samples the center row
+ * of the run for the representative color (farthest from both edges,
+ * avoiding border/artifact rows) and snaps it to white/black if within
+ * tolerance. Called from both the in-loop break and the post-loop cleanup
+ * in findUniformRowRuns to avoid duplicating this logic.
+ */
+function pushRun(
+  runs: UniformRun[],
+  data: Buffer,
+  width: number,
+  start: number,
+  end: number,
+  tolerance: number,
+): void {
+  const centerRow = Math.floor((start + end - 1) / 2);
+  const rawColor = getRowColor(data, width, centerRow);
+  runs.push({ start, end, color: snapToCanonicalColor(rawColor, tolerance) });
 }
 
 /** Converts an RGB color to a lowercase hex string (e.g. "#ff00aa"). */
@@ -681,9 +741,13 @@ export async function writeMetadataJson(
 }
 
 /**
- * isUniformRow checks whether every pixel in a given row matches the first
+ * isUniformRow checks whether every pixel in a given row matches the center
  * pixel within the per-channel tolerance. Operates on raw RGBA buffer data
  * (4 bytes per pixel, row-major order).
+ *
+ * The center pixel (x = width/2) is used as the reference instead of x=0
+ * because it minimizes the maximum distance to any pixel in the row and is
+ * less susceptible to edge artifacts from the stitching/resizing pipeline.
  */
 function isUniformRow(
   data: Buffer,
@@ -693,14 +757,15 @@ function isUniformRow(
 ): boolean {
   const start = rowIndex * width * 4;
   const end = start + width * 4;
-  // Reference color: first pixel in the row.
-  const r = data[start];
-  const g = data[start + 1];
-  const b = data[start + 2];
-  const a = data[start + 3];
+  // Reference color: center pixel in the row.
+  const center = start + Math.floor(width / 2) * 4;
+  const r = data[center];
+  const g = data[center + 1];
+  const b = data[center + 2];
+  const a = data[center + 3];
 
-  // Compare every subsequent pixel against the reference.
-  for (let i = start + 4; i < end; i += 4) {
+  for (let i = start; i < end; i += 4) {
+    if (i === center) continue;
     if (
       Math.abs(data[i] - r) > tolerance ||
       Math.abs(data[i + 1] - g) > tolerance ||
