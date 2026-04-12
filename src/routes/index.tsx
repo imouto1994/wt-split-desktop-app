@@ -28,13 +28,16 @@ import {
   writeMetadata,
 } from "@/actions/webtoon";
 import FolderPicker from "@/components/webtoon/folder-picker";
-import SegmentGrid from "@/components/webtoon/segment-grid";
+import SegmentGrid, {
+  EDIT_ASPECT_RATIO_THRESHOLD,
+} from "@/components/webtoon/segment-grid";
 import SplitEditorModal from "@/components/webtoon/split-editor-modal";
 import StatusDisplay from "@/components/webtoon/status-display";
 import { type SegmentMeta, toLocalFileUrl } from "@/components/webtoon/types";
 import {
   DEFAULT_COLOR_TOLERANCE,
   DEFAULT_MIN_GAP_HEIGHT,
+  MIN_SEGMENT_HEIGHT_PX,
 } from "@/constants";
 
 type StatusMode = "info" | "ok" | "warn" | "error";
@@ -183,6 +186,29 @@ function HomePage() {
   const isBusy = isProcessing || isCommitting;
   const hiddenCount = hiddenPaths.size;
   const splitCount = replacedSegments.size;
+
+  /**
+   * Segments flagged as problematic — either too short (likely processing
+   * artifacts) or too tall (likely need splitting). Hidden segments are
+   * excluded since the user has already decided to skip them.
+   * Used by the fixed action bar to render scroll-to hot links.
+   */
+  const flaggedSegments = useMemo(() => {
+    const result: { idx: number; seg: SegmentMeta; reason: "short" | "tall" }[] = [];
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      if (hiddenPaths.has(seg.path)) continue;
+      if (seg.height < MIN_SEGMENT_HEIGHT_PX) {
+        result.push({ idx: i, seg, reason: "short" });
+      } else if (seg.width > 0 && seg.height / seg.width > EDIT_ASPECT_RATIO_THRESHOLD) {
+        result.push({ idx: i, seg, reason: "tall" });
+      }
+    }
+    return result;
+  }, [segments, hiddenPaths]);
+
+  /** Whether the fixed action bar should be visible — always shown once segments exist. */
+  const showActionBar = segments.length > 0;
 
   // ─── Helpers ───────────────────────────────────────────────────────
 
@@ -726,37 +752,102 @@ function HomePage() {
           onUndoSplit={handleUndoSplit}
           isDisabled={isBusy}
         />
+      </section>
 
-        {/* Confirm / Discard bar — only when there are staged changes */}
-        {hasPendingChanges && (
-          <div className="mt-4 flex items-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-            <span className="text-sm">
-              Pending changes:
-              {hiddenCount > 0 && ` ${hiddenCount} hidden`}
-              {hiddenCount > 0 && splitCount > 0 && ","}
-              {splitCount > 0 && ` ${splitCount} split`}
-            </span>
-            <div className="ml-auto flex gap-2">
-              <button
-                type="button"
-                disabled={isCommitting}
-                onClick={handleDiscard}
-                className="rounded-md border border-border px-3 py-1.5 text-sm transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
-              >
-                Discard
-              </button>
-              <button
-                type="button"
-                disabled={isCommitting}
-                onClick={handleConfirm}
-                className="rounded-md bg-emerald-600 px-3 py-1.5 font-semibold text-sm text-white transition-colors hover:bg-emerald-700 disabled:pointer-events-none disabled:opacity-50"
-              >
-                Confirm
-              </button>
+      {/* Fixed action bar — pinned to the bottom of the viewport.
+          Shows hot links to flagged segments (too short / too tall) and
+          Confirm/Discard buttons when there are pending staged changes.
+          z-30 keeps it above page content but below the split editor modal
+          (shadcn Dialog uses z-50). */}
+      {showActionBar && (
+        <div className="fixed bottom-0 left-0 right-0 z-30 border-t border-border bg-card shadow-[0_-2px_8px_rgba(0,0,0,0.15)]">
+          <div className="mx-auto flex max-w-[1100px] flex-col gap-2 px-4 py-3">
+            {/* Hot links row — scrollable pills linking to flagged segments */}
+            {flaggedSegments.length > 0 && (
+              <div className="flex items-center gap-2 overflow-x-auto pb-0.5">
+                {flaggedSegments.some((f) => f.reason === "short") && (
+                  <>
+                    <span className="shrink-0 text-sky-400 text-xs font-medium">Short:</span>
+                    {flaggedSegments
+                      .filter((f) => f.reason === "short")
+                      .map((f) => (
+                        <button
+                          key={f.idx}
+                          type="button"
+                          onClick={() =>
+                            document
+                              .getElementById(`segment-${f.idx}`)
+                              ?.scrollIntoView({ behavior: "smooth", block: "end" })
+                          }
+                          className="shrink-0 rounded-full border border-sky-500/30 bg-sky-500/15 px-2.5 py-0.5 text-sky-400 text-xs transition-colors hover:bg-sky-500/25"
+                        >
+                          #{f.idx} &bull; {f.seg.height}px
+                        </button>
+                      ))}
+                  </>
+                )}
+                {flaggedSegments.some((f) => f.reason === "tall") && (
+                  <>
+                    <span className="shrink-0 text-amber-400 text-xs font-medium">Tall:</span>
+                    {flaggedSegments
+                      .filter((f) => f.reason === "tall")
+                      .map((f) => (
+                        <button
+                          key={f.idx}
+                          type="button"
+                          onClick={() =>
+                            document
+                              .getElementById(`segment-${f.idx}`)
+                              ?.scrollIntoView({ behavior: "smooth", block: "end" })
+                          }
+                          className="shrink-0 rounded-full border border-amber-500/30 bg-amber-500/15 px-2.5 py-0.5 text-amber-400 text-xs transition-colors hover:bg-amber-500/25"
+                        >
+                          #{f.idx} &bull; {f.seg.height}px
+                        </button>
+                      ))}
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* Confirm / Discard row — always visible so the user can access
+                actions without scrolling. Buttons are disabled when there are
+                no pending changes to prevent accidental no-op confirms. */}
+            <div className="flex items-center gap-3">
+              {hasPendingChanges ? (
+                <span className="text-sm">
+                  Pending changes:
+                  {hiddenCount > 0 && ` ${hiddenCount} hidden`}
+                  {hiddenCount > 0 && splitCount > 0 && ","}
+                  {splitCount > 0 && ` ${splitCount} split`}
+                </span>
+              ) : (
+                <span className="text-muted-foreground text-sm">
+                  {visibleSegments.length} visible / {segments.length} total
+                </span>
+              )}
+              <div className="ml-auto flex gap-2">
+                <button
+                  type="button"
+                  disabled={isCommitting || !hasPendingChanges}
+                  onClick={handleDiscard}
+                  className="rounded-md border border-border px-3 py-1.5 text-sm transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
+                >
+                  Discard
+                </button>
+                <button
+                  type="button"
+                  disabled={isCommitting || !hasPendingChanges}
+                  onClick={handleConfirm}
+                  className="rounded-md bg-emerald-600 px-3 py-1.5 font-semibold text-sm text-white transition-colors hover:bg-emerald-700 disabled:pointer-events-none disabled:opacity-50"
+                >
+                  Confirm
+                </button>
+              </div>
             </div>
           </div>
-        )}
-      </section>
+        </div>
+      )}
 
       {/* Split editor modal — rendered conditionally based on editingSegment */}
       <SplitEditorModal

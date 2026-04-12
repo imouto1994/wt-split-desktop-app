@@ -25,7 +25,9 @@ import { type SegmentMeta, toLocalFileUrl } from "./types";
 // to split." The Edit button is shown on ALL segments, but segments above
 // this threshold get a prominent amber Edit button to signal urgency, while
 // segments below it get a subtle outline Edit button for optional splitting.
-const EDIT_ASPECT_RATIO_THRESHOLD = 3;
+// Exported so the parent page can reuse the same threshold for hot links
+// in the fixed action bar.
+export const EDIT_ASPECT_RATIO_THRESHOLD = 3;
 
 interface SegmentGridProps {
   segments: SegmentMeta[];
@@ -41,7 +43,7 @@ interface SegmentGridProps {
 }
 
 /** True when the segment is tall enough that splitting is recommended. */
-function shouldSplit(seg: SegmentMeta): boolean {
+export function shouldSplit(seg: SegmentMeta): boolean {
   return seg.width > 0 && seg.height / seg.width > EDIT_ASPECT_RATIO_THRESHOLD;
 }
 
@@ -62,7 +64,8 @@ export default function SegmentGrid({
         return (
           <div
             key={seg.path}
-            className={`overflow-hidden rounded-lg border border-border bg-background ${isHidden ? "opacity-40" : ""}`}
+            id={`segment-${idx}`}
+            className={`scroll-mt-4 scroll-mb-32 overflow-hidden rounded-lg border border-border bg-background ${isHidden ? "opacity-40" : ""}`}
           >
             <img
               loading="lazy"

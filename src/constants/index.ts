@@ -54,3 +54,10 @@ export const inDevelopment = ENVIRONMENT_VARIABLES.NODE_ENV === "development";
  */
 export const DEFAULT_MIN_GAP_HEIGHT = 50;
 export const DEFAULT_COLOR_TOLERANCE = 20;
+
+/**
+ * Segments shorter than this (in pixels) are flagged as "too short" in the
+ * fixed action bar's hot links. Catches tiny slivers from the gap-detection
+ * pipeline without flagging legitimate small panels.
+ */
+export const MIN_SEGMENT_HEIGHT_PX = 100;

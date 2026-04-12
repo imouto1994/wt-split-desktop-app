@@ -157,12 +157,29 @@ The user can override these per-run in the "Processing Settings" area of the con
 
 ### Preview
 
-- **Grid**: Lazy-loaded thumbnails via `local-file://localhost/...` protocol, index + height + gap color swatches with hex labels. Shows **all** segments including hidden ones (dimmed at `opacity-40`). A dynamic summary ("N visible / M total") is shown in the section header.
+- **Grid**: Lazy-loaded thumbnails via `local-file://localhost/...` protocol, index + height + gap color swatches with hex labels. Shows **all** segments including hidden ones (dimmed at `opacity-40`). A dynamic summary ("N visible / M total") is shown in the section header. Each card has an `id="segment-{idx}"` attribute for scroll targeting from the fixed action bar.
 - **Open**: Calls `shell.showItemInFolder()` to reveal the file in the OS file manager (Finder / Explorer). Disabled on hidden segments.
 - **Edit**: Opens the multi-line split editor. Available on **all** segments — amber button for recommended splits (ratio > 3), outline button for optional splits. Disabled on hidden segments.
 - **Hide / Unhide**: Toggles segment visibility for the staged editing workflow.
 - **Undo Split**: Restores the original segment by deleting split children (when the segment has a `splitGroup`). Active even on hidden segments.
 - After splits, filenames may no longer follow strict `segment_XXX.webp` ordering; sorting is by full path string (numeric-aware).
+
+### Fixed Action Bar
+
+A `position: fixed` bar pinned to the bottom of the viewport (`z-30`, below the split editor modal at `z-50`). Contains two conditional rows:
+
+1. **Hot links row** — scrollable horizontal pills linking to segments flagged as problematic. Two categories:
+   - **Too short** (sky-colored pills): segments with `height < MIN_SEGMENT_HEIGHT_PX` (100px). Catches processing artifacts like tiny slivers.
+   - **Too tall** (amber-colored pills): segments with `height / width > EDIT_ASPECT_RATIO_THRESHOLD` (3). These likely need manual splitting.
+   - Hidden segments are excluded from hot links.
+   - Clicking a pill calls `scrollIntoView({ behavior: "smooth", block: "center" })` on the corresponding segment card.
+   - Row hidden when no segments are flagged.
+
+2. **Action row** — Confirm/Discard buttons with pending changes summary. Same as the previous inline bar, but now always accessible. Row hidden when `hasPendingChanges` is false.
+
+**Visibility**: The bar appears whenever `segments.length > 0` — i.e., always after processing completes. The Confirm/Discard buttons are always visible but disabled when there are no pending changes. When no changes are pending, the action row shows a segment summary ("N visible / M total") instead of the pending changes text.
+
+**Layout clearance**: `base-layout.tsx` uses `pb-32` (128px) bottom padding on the `<main>` scroll container to ensure the last segment card is never obscured by the fixed bar.
 
 ---
 
@@ -274,9 +291,9 @@ Two independent APIs:
 
 ### Renderer UI
 
-- **`src/routes/index.tsx`**: Single page with folder pickers, processing parameters, process button, status display, segment grid, split editor modal, and staged editing controls (Confirm/Discard). During processing, the status display shows stage-aware progress ("Stitching 15 images…", "Writing segment 3 of 12…", etc.) via IPC events from the main process, replacing the previous static "Processing…" message.
+- **`src/routes/index.tsx`**: Single page with folder pickers, processing parameters, process button, status display, segment grid, split editor modal, and a **fixed action bar** pinned to the bottom of the viewport. The action bar contains hot links to flagged segments (too short or too tall) and Confirm/Discard buttons when there are pending staged changes. During processing, the status display shows stage-aware progress ("Stitching 15 images…", "Writing segment 3 of 12…", etc.) via IPC events from the main process, replacing the previous static "Processing…" message.
 - **`SegmentMeta`** (`src/components/webtoon/types.ts`): Renderer segment state includes `topGapColor`, `bottomGapColor`, `topEdgeStrip`, `bottomEdgeStrip` (all `string | null`) alongside path, dimensions, optional `splitGroup`, and optional `cacheKey` (timestamp for image URL cache busting).
-- **State**: Core state (`inputDir`, `outputDir`, `minGapHeight`, `colorTolerance`), staging state (`baseSegments`, `segments`, `hiddenPaths`, `replacedSegments`, `createdBySplitFiles`), UI state (`statusMessage`, `statusMode`, `isProcessing`, `isCommitting`, `editingSegment`). Derived: `hasPendingChanges`, `visibleSegments`.
+- **State**: Core state (`inputDir`, `outputDir`, `minGapHeight`, `colorTolerance`), staging state (`baseSegments`, `segments`, `hiddenPaths`, `replacedSegments`, `createdBySplitFiles`), UI state (`statusMessage`, `statusMode`, `isProcessing`, `isCommitting`, `editingSegment`). Derived: `hasPendingChanges`, `visibleSegments`, `flaggedSegments` (segments with height issues), `showActionBar`.
 - **`loadSegmentMetadata`**: Creates `new Image()` elements with cache-busted `local-file://localhost/...?v=<timestamp>` URLs to read `naturalWidth`/`naturalHeight` for each segment. Sets a shared `cacheKey` (via `Date.now()`) on all resulting metas so grid and editor `<img>` elements also bypass the decode cache. Accepts an optional `splitGroup` tag to assign to the resulting metas.
 - **Sorting**: Segments are always sorted by path with `localeCompare({ numeric: true, sensitivity: "base" })`.
 
@@ -302,9 +319,11 @@ Shared defaults and types in `src/constants/index.ts` (importable by main proces
 - `IPC_CHANNELS.PROCESSING_PROGRESS` — Electron IPC channel name for push-style processing progress events from main → renderer.
 - `ProgressInfo` — type for progress payloads: `{ stage: ProgressStage, current?, total?, detail? }`. Stages are `"stitching"`, `"analyzing"`, `"writing"`, `"finalizing"`. Shared across main (processor callback), preload (contextBridge), and renderer (subscription + type declaration in `types.d.ts`).
 
+- `MIN_SEGMENT_HEIGHT_PX = 100` — segments shorter than this (in pixels) are flagged as "too short" in the fixed action bar's hot links. Catches tiny slivers from the gap-detection pipeline without flagging legitimate small panels.
+
 Editable in `src/components/webtoon/segment-grid.tsx`:
 
-- `EDIT_ASPECT_RATIO_THRESHOLD` — height/width ratio above which the Edit button appears (default: `3`).
+- `EDIT_ASPECT_RATIO_THRESHOLD` — height/width ratio above which the Edit button gets a prominent amber style (default: `3`). Also used by the fixed action bar to flag segments as "too tall" in the hot links.
 
 ---
 

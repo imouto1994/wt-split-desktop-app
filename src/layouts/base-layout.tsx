@@ -9,7 +9,7 @@ export default function BaseLayout({
   return (
     <>
       <DragWindowRegion title="Webtoon Stitch & Split" />
-      <main className="h-screen overflow-auto p-4 pb-20">{children}</main>
+      <main className="h-screen overflow-auto p-4 pb-32">{children}</main>
     </>
   );
 }
