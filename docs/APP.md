@@ -64,7 +64,7 @@ src/
     drag-window-region.tsx    # Custom title bar drag region
   layouts/
     base-layout.tsx           # DragWindowRegion + scrollable <main>
-  styles/global.css           # Tailwind 4 imports, theme variables
+  styles/global.css           # Tailwind 4 imports, theme variables, global thin scrollbar CSS
   localization/               # i18next setup (en, pt-BR)
 ```
 

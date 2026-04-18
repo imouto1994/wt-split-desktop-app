@@ -46,6 +46,7 @@
 
 - Stack: TypeScript + Electron + React 19, with oRPC for IPC, Sharp for image processing, Tailwind 4 + shadcn/ui for styling.
 - **Read [docs/APP.md](./docs/APP.md) first** before making any changes — it contains the full architecture, all handlers, processor functions, custom protocol details, and configuration knobs.
+- Always prefer shadcn/ui wrapper components (`@/components/ui/*`) over importing `@radix-ui` primitives directly. Check `src/components/ui/` for available components before building custom UI. Install new components with `npx shadcn add <component>`.
 - Use `lucide-react` for UI icons.
 - Don't build after every little change. If `npm run check` passes, assume changes work.
 

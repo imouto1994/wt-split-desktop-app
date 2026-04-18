@@ -28,6 +28,10 @@ Always use these semantic classes. They auto-adapt to light/dark theme:
 
 This project uses the **radix-mira** style of shadcn/ui with Radix primitives.
 
+### Prefer shadcn wrappers over raw Radix
+
+Never import `@radix-ui/*` directly in route or component files. Always use the shadcn wrapper from `@/components/ui/`. If no wrapper exists, install it first (`npx shadcn add <name>`).
+
 ### Adding new components
 
 ```bash
