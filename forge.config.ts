@@ -24,12 +24,17 @@ const config: ForgeConfig = {
       /*
        * Publish release on GitHub as draft.
        * Remember to manually publish it on GitHub website after verifying everything is correct.
+       *
+       * Both .github/workflows/publish.yaml runners (windows-latest, then macos-latest)
+       * point this publisher at the same draft release. The macOS job is serialized
+       * after the Windows job to avoid both runners simultaneously calling
+       * getOrCreateDraftRelease and racing to POST /releases.
        */
       name: "@electron-forge/publisher-github",
       config: {
         repository: {
-          owner: "LuanRoger",
-          name: "electron-shadcn",
+          owner: "imouto1994",
+          name: "wt-split-desktop-app",
         },
         draft: true,
         prerelease: false,

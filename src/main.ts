@@ -77,10 +77,19 @@ async function installExtensions() {
 }
 
 function checkForUpdates() {
+  // ElectronPublicUpdateService is the Electron team's hosted update.electronjs.org
+  // proxy in front of the GitHub Releases API. It only works for PUBLIC GitHub
+  // repos; if this app is ever moved to a private repo, switch to
+  // UpdateSourceType.StaticStorage with a custom update server (see
+  // https://www.electronjs.org/docs/latest/tutorial/updates).
+  //
+  // The repo here must match the publisher target in forge.config.ts so the
+  // releases produced by `npm run publish` are the same ones this auto-updater
+  // polls.
   updateElectronApp({
     updateSource: {
       type: UpdateSourceType.ElectronPublicUpdateService,
-      repo: "LuanRoger/electron-shadcn",
+      repo: "imouto1994/wt-split-desktop-app",
     },
   });
 }

@@ -81,6 +81,49 @@ Now you can go directly to `/src/routes/index.tsx` and modify the app as you wan
 
 > You can also delete the `/src/routes/second.tsx` file if you don't want a second page.
 
+## Downloading a build
+
+Per-commit Windows and macOS (arm64 / Apple Silicon) builds are produced by the `Build` workflow on every push to `main` and stored as workflow artifacts for 30 days.
+
+**To download:**
+
+1. Go to the [Actions tab](https://github.com/imouto1994/wt-split-desktop-app/actions/workflows/build.yaml) of the repository.
+2. Open the latest successful run of the `Build` workflow.
+3. Scroll to the **Artifacts** section at the bottom of the run summary and download:
+   - `windows-installer` — Squirrel `Setup.exe` + `.nupkg` + `RELEASES`
+   - `macos-arm64-build` — `<name>-darwin-arm64-<version>.zip`
+
+Tagged GitHub Releases (produced manually via the `Publish Release` workflow) contain the same installers — pick whichever is more convenient.
+
+### Builds are unsigned — known warnings
+
+These builds are **not code-signed and not notarized**. Users will see warnings on first launch.
+
+#### Windows
+
+When you run the `Setup.exe`, Microsoft Defender SmartScreen may block it with "Windows protected your PC".
+
+- Click **More info**
+- Click **Run anyway**
+
+#### macOS (Apple Silicon)
+
+After unzipping the build, macOS will quarantine the `.app` and refuse to launch it with a "damaged and can't be opened" or "cannot be verified" dialog.
+
+**Option A — right-click bypass** (works on most macOS versions):
+
+1. Drag `Webtoon Stitch & Split.app` into `/Applications`.
+2. In Finder, **right-click** the app → **Open** → click **Open** in the warning dialog.
+3. After this one-time approval, double-clicking works normally.
+
+**Option B — strip quarantine attribute** (works on every macOS version including the strictest):
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Webtoon Stitch & Split.app"
+```
+
+Producing signed and notarized builds would require purchasing an Apple Developer ID certificate (~$99/year) and adding it as a GitHub Actions secret; tracked separately, not part of the current build pipeline.
+
 ## Auto update
 
 > [!WARNING]

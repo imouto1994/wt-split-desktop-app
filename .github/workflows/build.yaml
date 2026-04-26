@@ -1,0 +1,89 @@
+# Build
+#
+# Produces unsigned per-commit installers for Windows (Squirrel) and macOS arm64
+# (zipped .app) and uploads them as workflow artifacts so testers can download a
+# binary for any commit on `main` without having to set up a local Electron toolchain.
+#
+# Triggers:
+#   - push to main: standard per-commit builds.
+#   - workflow_dispatch: manual trigger for verifying changes to this workflow
+#     itself, or for re-running a build on demand.
+#
+# Concurrency:
+#   - cancel-in-progress drops still-running builds when a newer commit lands on
+#     the same ref. With ~10-15 minute build times this avoids stacking up wasted
+#     CI minutes during rapid pushes.
+#
+# Out of scope (per plan, see plan: desktop-app-windows-macos-build):
+#   - PR builds (would double CI minutes; tests already cover correctness on PRs).
+#   - macOS Intel (x64) and universal binaries.
+#   - Code signing / notarization. End users will see SmartScreen / Gatekeeper
+#     warnings; README documents the workarounds.
+#   - MakerDMG. V1 ships ZIP only. DMG is deferred until ZIP is verified green
+#     because @electron-forge/maker-dmg's transitive `appdmg` is darwin-only and
+#     can crash the Windows runner if Forge eagerly imports its module.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          # `cache: npm` caches the npm registry tarball cache. Sharp's libvips
+          # binaries are downloaded by a post-install script and bypass this
+          # cache, so they re-download (~10 MB) per run; acceptable.
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build Windows installer
+        # electron-forge make auto-detects platform=win32 and arch=x64 from the
+        # host. Produces:
+        #   out/make/squirrel.windows/x64/<ProductName>-<version> Setup.exe
+        #   out/make/squirrel.windows/x64/<ProductName>-<version>-full.nupkg
+        #   out/make/squirrel.windows/x64/RELEASES
+        run: npm run make
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: out/make/**/*
+          retention-days: 30
+          # Hard-fail if Forge silently produced nothing instead of uploading an
+          # empty artifact that looks like a successful build.
+          if-no-files-found: error
+
+  build-macos:
+    # `macos-latest` resolves to `macos-15-arm64` (Apple Silicon) as of 2026,
+    # which matches the arm64-only requirement without explicit pinning.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build macOS arm64 ZIP
+        # Auto-detects platform=darwin and arch=arm64 from the host. Produces:
+        #   out/make/zip/darwin/arm64/<ProductName>-darwin-arm64-<version>.zip
+        run: npm run make
+      - name: Upload macOS arm64 ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-build
+          path: out/make/**/*
+          retention-days: 30
+          if-no-files-found: error

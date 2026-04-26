@@ -1,11 +1,59 @@
+# Publish Release
+#
+# Manual workflow that builds and publishes a draft GitHub Release containing
+# both Windows (Squirrel) and macOS arm64 (ZIP) installers. Triggered manually
+# via `workflow_dispatch` so version-bump commits don't accidentally cut releases.
+#
+# Why two jobs in series instead of a parallel matrix?
+#
+# Forge's GitHub publisher calls getOrCreateDraftRelease(): it lists drafts for
+# the package.json `version`'s tag, and creates one if not found. With two
+# runners executing in parallel, both can see "no draft" simultaneously, both
+# POST /releases, and one wins while the loser fails with HTTP 422 ("already
+# exists"). With `fail-fast: false` matrix the loser would silently leave that
+# platform's installers off the release, requiring a manual re-run.
+#
+# Serializing macOS after Windows guarantees the draft already exists when the
+# macOS publisher runs, so it just appends assets to the existing draft. Cost:
+# +~5 minutes of wall time for the macOS step that previously could have run in
+# parallel. Worth it for reliability.
 name: Publish Release
 
 on:
   workflow_dispatch:
 
 jobs:
-  publish-release:
+  publish-windows:
     runs-on: windows-latest
+    permissions:
+      # Required so the @electron-forge/publisher-github plugin can create the
+      # draft release and upload assets via the default GITHUB_TOKEN.
+      contents: write
+    steps:
+      - name: Checkout git repo
+        uses: actions/checkout@v6
+
+      - name: Install Node and NPM
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install and build
+        run: npm ci
+
+      - name: Publish Release (Windows installer)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run publish
+
+  publish-macos:
+    # `needs: publish-windows` serializes after the Windows job has created the
+    # draft release; this avoids the parallel-create race described above.
+    needs: publish-windows
+    # macos-latest resolves to macos-15-arm64 in 2026 — Apple Silicon, matching
+    # the arm64-only build requirement.
+    runs-on: macos-latest
     permissions:
       contents: write
     steps:
@@ -21,7 +69,7 @@ jobs:
       - name: Install and build
         run: npm ci
 
-      - name: Publish Release
+      - name: Publish Release (macOS arm64 ZIP)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run publish

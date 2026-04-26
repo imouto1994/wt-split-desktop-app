@@ -341,6 +341,22 @@ Sharp is a C++ addon that cannot be bundled by Vite. It is:
 - **Makers**: Squirrel (Windows), ZIP (macOS), RPM + DEB (Linux).
 - **Fuses**: ASAR integrity, cookie encryption, node options disabled.
 - **Vite plugin**: Separate configs for main, preload, and renderer.
+- **Publisher**: `@electron-forge/publisher-github` configured to publish draft releases to `imouto1994/wt-split-desktop-app`. The `update-electron-app` integration in `src/main.ts` polls the same repo via Electron's public update service (works only because the repo is public).
+
+### CI builds (GitHub Actions)
+
+Three workflows live in `.github/workflows/`. The desktop app is its own Git repo nested in the parent monorepo folder, so workflows live next to the app code, not at the parent repo root.
+
+| Workflow | Trigger | Runner(s) | What it produces |
+|---|---|---|---|
+| `check.yaml` | PR to `main` | `ubuntu-latest` | Ultracite lint result; no build artifact |
+| `testing.yaml` | push/PR to `main` | `ubuntu-latest` (unit) + `windows-latest` (e2e) | Vitest unit results + Playwright HTML report (build is produced by `npm run make` on Windows but discarded — only `playwright-report/` is uploaded) |
+| `build.yaml` | push to `main`, `workflow_dispatch` | `windows-latest` + `macos-latest` (parallel jobs) | Per-commit downloadable installers: Windows Squirrel `Setup.exe` + `.nupkg` + `RELEASES`; macOS arm64 ZIP. 30-day retention. Hard-fails if Forge produced no files (`if-no-files-found: error`). Concurrency-cancellable so rapid pushes don't stack runs. |
+| `publish.yaml` | `workflow_dispatch` (manual) | `windows-latest` then `macos-latest` (serialized via `needs:`) | Single GitHub draft release containing both platforms' installers. Serialized to avoid the `getOrCreateDraftRelease` race where two parallel runners both try to `POST /releases`. |
+
+**Per-commit build artifacts** for `main` are produced unsigned and unnotarized (V1 scope). End users will see SmartScreen on Windows and Gatekeeper "damaged or can't be opened" on macOS arm64 — the README has the workarounds. Production distribution would require purchasing an Apple Developer ID certificate + a Windows EV/OV code signing cert.
+
+**macOS DMG** is intentionally not included in V1. Adding `MakerDMG` requires the `@electron-forge/maker-dmg` package whose transitive `appdmg` is darwin-only; if Forge eagerly imports it on the Windows runner during `electron-forge make`, the Windows job breaks. DMG can be added in a follow-up after the V1 ZIP-only flow is verified green on both runners.
 
 ---
 
