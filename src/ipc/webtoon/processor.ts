@@ -24,6 +24,49 @@ import {
 } from "@/constants";
 import type { ProgressInfo } from "@/constants";
 
+/**
+ * Shared Sharp constructor options for the webtoon pipeline.
+ *
+ * `limitInputPixels: false` disables Sharp's default 268,435,456-pixel
+ * (0x3FFF × 0x3FFF) safety limit on input image dimensions. Webtoon chapters
+ * are very tall by nature — a stitched 800px-wide composite of ~50 panels
+ * easily crosses the default limit and crashes with "Input image exceeds
+ * pixel limit" inside `.toBuffer()` (which then surfaces to the renderer as
+ * "Internal server error"). For this tool's workload — single-user, admin
+ * processing trusted source images — the safer-than-default is unnecessary
+ * and actively harmful.
+ *
+ * Trade-off: with no upper bound, a truly enormous input (e.g. 100,000 panels
+ * stitched into a single column) could exhaust memory. The raw RGBA buffer
+ * for analysis is `width × height × 4` bytes, so a 1000×1,000,000 stitched
+ * image would allocate 4 GB. That's the practical ceiling, not Sharp's
+ * 268 MP check.
+ */
+const SHARP_OPTS: sharp.SharpOptions = { limitInputPixels: false };
+
+/**
+ * Opens a Sharp pipeline on existing image data (file path or buffer) with
+ * the project-wide options (notably the disabled pixel limit). Wrapping all
+ * sharp() construction in helpers guarantees a new call site in the processor
+ * can't forget the option and re-introduce the "Input image exceeds pixel
+ * limit" crash on tall webtoons.
+ */
+function openSharp(
+  input: string | Buffer | Uint8Array | ArrayBuffer,
+): sharp.Sharp {
+  return sharp(input, SHARP_OPTS);
+}
+
+/**
+ * Creates a new Sharp pipeline from a synthetic canvas description (the
+ * `{ create: ... }` form). Sharp's overload for this form takes a single
+ * SharpOptions argument that embeds both the create spec and any pipeline
+ * options, so SHARP_OPTS is merged in rather than passed as a second arg.
+ */
+function createSharp(create: sharp.Create): sharp.Sharp {
+  return sharp({ create, ...SHARP_OPTS });
+}
+
 interface ProcessWebtoonInput {
   inputDir: string;
   outputDir: string;
@@ -171,7 +214,9 @@ export async function processWebtoon({
   // This forces Sharp to fully resolve the lazy composite pipeline before
   // we attempt a raw pixel read, avoiding "no pixels" errors.
   const stitchedBuffer = await stitched.png().toBuffer();
-  const stitchedSharp = sharp(stitchedBuffer);
+  // openSharp() disables the pixel-limit check that would reject this large
+  // stitched composite (see SHARP_OPTS comment at the top of this file).
+  const stitchedSharp = openSharp(stitchedBuffer);
 
   onProgress?.({ stage: "analyzing" });
 
@@ -286,7 +331,7 @@ export async function splitSegment({
   breakpoints,
   keepOriginal,
 }: SplitSegmentInput): Promise<SplitSegmentResult> {
-  const meta = await sharp(filePath).metadata();
+  const meta = await openSharp(filePath).metadata();
   if (!meta.width || !meta.height) {
     throw new Error("Unable to read image metadata.");
   }
@@ -319,7 +364,7 @@ export async function splitSegment({
     // Always output WebP lossless regardless of the input format, so
     // splitting old PNG segments still produces WebP sub-segments.
     const outPath = path.join(dir, `${name}_${stamp}_${suffix}.webp`);
-    await sharp(filePath)
+    await openSharp(filePath)
       .extract({ left: 0, top, width, height: sliceHeight })
       .webp({ lossless: true })
       .toFile(outPath);
@@ -329,7 +374,7 @@ export async function splitSegment({
   // Extract 1px-tall edge strips at interior split boundaries BEFORE
   // potentially deleting the source file. The source is needed for extraction.
   const numChildren = edges.length - 1;
-  const sourceSharp = sharp(filePath);
+  const sourceSharp = openSharp(filePath);
   const edgeStrips: EdgeStripData[] = [];
   for (let i = 0; i < numChildren; i++) {
     // Exterior edges (first-top, last-bottom) are null — the renderer
@@ -376,7 +421,7 @@ export async function mergeSegments({
 
   const metadata = await Promise.all(
     filePaths.map(async (file) => {
-      const meta = await sharp(file).metadata();
+      const meta = await openSharp(file).metadata();
       if (!meta.width || !meta.height) {
         throw new Error(`Missing dimensions for ${file}`);
       }
@@ -390,20 +435,18 @@ export async function mergeSegments({
   let totalHeight = 0;
 
   for (const m of metadata) {
-    const { data, info } = await sharp(m.file)
+    const { data, info } = await openSharp(m.file)
       .resize({ width: targetWidth })
       .toBuffer({ resolveWithObject: true });
     composites.push({ input: data, top: totalHeight, left: 0 });
     totalHeight += info.height;
   }
 
-  await sharp({
-    create: {
-      width: targetWidth,
-      height: totalHeight,
-      channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 0 },
-    },
+  await createSharp({
+    width: targetWidth,
+    height: totalHeight,
+    channels: 4,
+    background: { r: 0, g: 0, b: 0, alpha: 0 },
   })
     .composite(composites)
     .webp({ lossless: true })
@@ -455,7 +498,7 @@ async function createStitchedImage(
 ): Promise<sharp.Sharp> {
   const metadata: ImageMeta[] = await Promise.all(
     imagePaths.map(async (file) => {
-      const meta = await sharp(file).metadata();
+      const meta = await openSharp(file).metadata();
       if (!meta.width || !meta.height) {
         throw new Error(`Missing dimensions for ${file}`);
       }
@@ -475,7 +518,7 @@ async function createStitchedImage(
 
   for (const meta of metadata) {
     // .rotate() without arguments applies EXIF-based auto-rotation.
-    const { data, info } = await sharp(meta.file)
+    const { data, info } = await openSharp(meta.file)
       .rotate()
       .resize({ width: targetWidth })
       .toBuffer({ resolveWithObject: true });
@@ -484,13 +527,11 @@ async function createStitchedImage(
     totalHeight += info.height;
   }
 
-  return sharp({
-    create: {
-      width: targetWidth,
-      height: totalHeight,
-      channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 0 },
-    },
+  return createSharp({
+    width: targetWidth,
+    height: totalHeight,
+    channels: 4,
+    background: { r: 0, g: 0, b: 0, alpha: 0 },
   }).composite(composites);
 }
 

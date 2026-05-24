@@ -228,7 +228,11 @@ The `pickInput`, `pickOutput`, and `processWebtoon` handlers use the `ipcContext
 
 ### Processor (`src/ipc/webtoon/processor.ts`)
 
-Pure Node/Sharp module with no Electron imports. Exports:
+Pure Node/Sharp module with no Electron imports.
+
+**Sharp pixel-limit override**: All `sharp()` construction in this file goes through two helpers — `openSharp(input)` for files/buffers and `createSharp(create)` for synthetic canvases — both of which set `limitInputPixels: false`. Without this, Sharp throws `Error: Input image exceeds pixel limit` whenever a stitched composite exceeds the default 268,435,456-pixel (0x3FFF × 0x3FFF) cap. Webtoon chapters easily cross this — a 800px-wide composite of ~50 panels at 6000px each is 240 MP and right at the edge. The trade-off: with no upper bound, a truly enormous input (e.g. 100,000 panels) could exhaust memory; the raw RGBA buffer for analysis is `width × height × 4` bytes, so the practical ceiling is set by available RAM, not by the Sharp check. **Always use these helpers rather than `sharp()` directly — a new call site that forgets the option will re-introduce the crash on tall webtoons.**
+
+Exports:
 
 - **Types**: `ProcessedSegment` (`{ filePath, topGapColor, bottomGapColor, topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`), `SegmentGapMeta` (gap + edge strip + brightness metadata for sidecar serialization), `EdgeStripData` (`{ topEdgeStrip, bottomEdgeStrip, topEdgeStripIsLight, bottomEdgeStripIsLight }`), `SplitSegmentResult` (`{ files, edgeStrips }`).
 - `processWebtoon({ inputDir, outputDir, minGapHeight?, colorTolerance?, onProgress? })` → `Promise<ProcessedSegment[]>` — writes segment WebP lossless files, captures **gap colors** (center-row color of each removed uniform strip, snapped to white/black when within tolerance) and writes **`metadata.json`** in the output directory. Edge strips are `null` for interior auto-split segments. The **first segment's top row** and **last segment's bottom row** get edge strips with brightness classification (`isLight`) for column boundary gap rendering. Processing params fall back to defaults from `src/constants/index.ts` when omitted. The optional `onProgress` callback (typed as `(info: ProgressInfo) => void`) fires at each pipeline stage: `stitching` (with image count), `analyzing`, `writing` (with segment index/total/filename after each write), and `finalizing`.

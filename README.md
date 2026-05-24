@@ -147,7 +147,7 @@ The app ships with DevTools enabled in production builds. Open with `Ctrl+Shift+
 | Symptom | Likely cause | Where to look |
 |---|---|---|
 | Status display shows `Error: ENOENT...` or similar | A file system path doesn't exist | Check the path in the input/output folder pickers |
-| Status display shows `Error: Input image exceeds pixel limit` | Stitched image is too large for Sharp's default 268MP limit | Try processing fewer images at a time |
+| Status display shows `Error: Input image exceeds pixel limit` | Pixel-limit override missing on a new code path (the processor's standard helpers disable this limit, but a regression could re-introduce it) | File a bug — see `docs/APP.md` Processor section about `openSharp` / `createSharp` helpers |
 | App opens but folder picker does nothing | Likely a Sharp / native module init failure — main process crashed at startup | Check `main.log` for an `Error during app initialization` entry near the most recent session banner |
 | App crashes silently on launch | Catch-all fallback — main process died before the error dialog could fire | Run the `.exe` from `cmd` so any synchronous stderr output is visible, then check `main.log` |
 
