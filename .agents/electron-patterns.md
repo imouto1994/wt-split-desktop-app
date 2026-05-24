@@ -42,20 +42,40 @@ Use the shared `toLocalFileUrl()` helper from `src/components/webtoon/types.ts`.
 
 ## Native Modules (Sharp)
 
-Sharp is a C++ addon and requires special handling:
+Sharp is a C++ addon and requires THREE coordinated things to work in the packaged app:
 
-1. **Externalized from Vite** in `vite.main.config.mts`:
+1. **Externalized from Vite** in `vite.main.config.mts`. Both `sharp` and the platform-specific `@img/*` runtime packages (Sharp 0.33+ ships native binaries in `@img/sharp-<platform>-<arch>` and libvips in `@img/sharp-libvips-<platform>-<arch>`):
    ```typescript
-   build: { rollupOptions: { external: ["sharp"] } }
+   build: { rollupOptions: { external: ["sharp", /^@img\//] } }
    ```
 
-2. **Unpacked from ASAR** by `@electron-forge/plugin-auto-unpack-natives` in `forge.config.ts`. Without this, Sharp's `.node` binaries would be trapped inside the ASAR archive and fail to load.
+2. **Copied into the packaged app** by `@timfish/forge-externals-plugin` in `forge.config.ts` (must come AFTER `VitePlugin`):
+   ```typescript
+   {
+     name: "@timfish/forge-externals-plugin",
+     config: { externals: ["sharp"], includeDeps: true },
+   }
+   ```
+   Vite's `external` only marks Sharp as not-to-bundle; it does NOT copy `node_modules/sharp/` into the final app. Without this plugin, the packaged app crashes with `Cannot find module 'sharp'`.
 
-3. **Only imported in the main process** — Sharp runs in `src/ipc/webtoon/processor.ts`, never in the renderer.
+3. **Unpacked from the asar** so the OS dynamic linker can `dlopen()` the `.node` / `.dylib` / `.dll` binaries — they cannot be loaded from inside an asar:
+   ```typescript
+   packagerConfig: {
+     asar: { unpack: "**/node_modules/{sharp,@img}/**/*" },
+   }
+   ```
+
+4. **Only imported in the main process** — Sharp runs in `src/ipc/webtoon/processor.ts`, never in the renderer.
+
+### Why `@electron-forge/plugin-auto-unpack-natives` is not used
+
+`AutoUnpackNativesPlugin` only adds an `asar.unpack` entry for native modules already present in the asar. It can't help when the module isn't being copied into the asar in the first place (Sharp's case with the Vite plugin). The explicit `asar.unpack` glob + `@timfish/forge-externals-plugin` combo handles both halves correctly.
 
 ### Adding other native modules
 
-Follow the same pattern: externalize in `vite.main.config.mts`, ensure auto-unpack-natives is in `forge.config.ts` plugins.
+1. Add to Vite externals in `vite.main.config.mts` (including any platform-specific sub-packages).
+2. Add to `externals: [...]` in the `@timfish/forge-externals-plugin` config in `forge.config.ts`.
+3. Extend the `asar.unpack` glob, e.g. `**/node_modules/{sharp,@img,<new-native-pkg>}/**/*`.
 
 ## Window Configuration
 

@@ -331,10 +331,26 @@ Editable in `src/components/webtoon/segment-grid.tsx`:
 
 ### Sharp (native module)
 
-Sharp is a C++ addon that cannot be bundled by Vite. It is:
+Sharp is a C++ addon. Sharp 0.33+ split its prebuilt binaries into platform-specific `@img/sharp-<platform>-<arch>` packages (plus `@img/sharp-libvips-<platform>-<arch>` for libvips). Three things must line up for the packaged app to load Sharp:
 
-1. Externalized in `vite.main.config.mts` via `build.rollupOptions.external: ["sharp"]`.
-2. Unpacked from the ASAR archive by `@electron-forge/plugin-auto-unpack-natives` in `forge.config.ts`.
+1. **Externalized in `vite.main.config.mts`**: `build.rollupOptions.external: ["sharp", /^@img\//]`. Both `sharp` and the dynamically-required `@img/*` packages must be excluded from the bundle so Rollup doesn't try to follow the platform-specific dynamic import.
+
+2. **Included in the packaged app by `@timfish/forge-externals-plugin`** (in `forge.config.ts` plugins, AFTER `VitePlugin`). The Vite plugin only marks Sharp as external; it does NOT copy `node_modules/sharp/` into the final app. Without this plugin, the packaged app crashes with `Cannot find module 'sharp'`. The plugin is configured with `externals: ["sharp"], includeDeps: true` so Sharp's full transitive tree (including `@img/sharp-<platform>-<arch>` and `@img/sharp-libvips-<platform>-<arch>`) is copied into the packaged app's `node_modules`.
+
+3. **Unpacked from the asar archive** via `packagerConfig.asar.unpack: "**/node_modules/{sharp,@img}/**/*"` in `forge.config.ts`. Native binaries (`.node`, `.dylib`, `.dll`, `.so`) cannot be loaded from inside an asar — the OS dynamic linker needs them on the real filesystem. The glob covers both `sharp/` and the `@img/` family.
+
+After `npm run make`, you can verify all three are working by inspecting the packaged output:
+```
+out/Webtoon Stitch & Split-<platform>-<arch>/.../Resources/app.asar.unpacked/node_modules/
+├── sharp/
+└── @img/
+    ├── sharp-<platform>-<arch>/
+    └── sharp-libvips-<platform>-<arch>/
+```
+
+If the `app.asar.unpacked` directory is missing or empty, the packaging chain is broken.
+
+**Note**: `@electron-forge/plugin-auto-unpack-natives` was previously listed here but has been removed — it only adds an `asar.unpack` glob for native modules already present in the asar, which doesn't help when the module isn't being copied into the asar in the first place. The explicit `asar.unpack` glob plus `@timfish/forge-externals-plugin` handles both halves correctly. See [Sharp #4116](https://github.com/lovell/sharp/issues/4116) and [Forge #4144](https://github.com/electron/forge/issues/4144) for the upstream discussion.
 
 ### Electron Forge
 

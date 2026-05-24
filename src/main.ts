@@ -2,15 +2,17 @@
  * Electron main process entry point.
  *
  * Responsibilities:
- *   1. Register the local-file:// custom protocol (must happen before app.ready)
- *   2. Create the BrowserWindow with appropriate size and security settings
- *   3. Register the protocol handler for serving local image files
- *   4. Bootstrap the oRPC server for renderer-to-main IPC
- *   5. Install dev tools and set up auto-updates
+ *   1. Handle Squirrel install/update/uninstall events on Windows (must be
+ *      the FIRST thing that runs so we quit immediately for those invocations)
+ *   2. Register the local-file:// custom protocol (must happen before app.ready)
+ *   3. Create the BrowserWindow with appropriate size and security settings
+ *   4. Register the protocol handler for serving local image files
+ *   5. Bootstrap the oRPC server for renderer-to-main IPC
+ *   6. Install dev tools and set up auto-updates
  */
 import fs from "node:fs";
 import path from "node:path";
-import { app, BrowserWindow, protocol } from "electron";
+import { app, BrowserWindow, dialog, protocol } from "electron";
 import { ipcMain } from "electron/main";
 import {
   installExtension,
@@ -20,6 +22,27 @@ import { UpdateSourceType, updateElectronApp } from "update-electron-app";
 import { ipcContext } from "@/ipc/context";
 import { IPC_CHANNELS, inDevelopment } from "./constants";
 import { getBasePath } from "./utils/path";
+
+// Squirrel (the Windows installer/updater Forge uses) spawns this exe with
+// --squirrel-install / --squirrel-updated / --squirrel-uninstall /
+// --squirrel-obsolete during install, update, and uninstall events. Each of
+// those invocations needs to perform a small bookkeeping task (create
+// desktop shortcuts, remove them, etc.) and quit IMMEDIATELY — within
+// ~15 seconds, otherwise Squirrel times out and the installer can leave the
+// system in an inconsistent state.
+//
+// electron-squirrel-startup handles all four events automatically; the
+// returned boolean is true when the helper handled an event and the process
+// should now quit. This MUST run before any other Electron API (especially
+// BrowserWindow / app.whenReady) — otherwise the Squirrel invocations would
+// spawn unwanted windows during install.
+//
+// require() (not import) is used because the package's behaviour depends on
+// being evaluated synchronously at startup; the ESM equivalent would defer
+// it past the synchronous module init window.
+if (require("electron-squirrel-startup")) {
+  app.quit();
+}
 
 // Register the custom scheme BEFORE app.ready — this is a Chromium requirement.
 // The scheme needs to be "standard" so URLs are parsed with authority/path
@@ -155,7 +178,20 @@ app.whenReady().then(async () => {
     checkForUpdates();
     await setupORPC();
   } catch (error) {
+    // Loud-failure path: in packaged builds, console output is invisible to
+    // the user. If we only log here, a broken init (e.g., a missing native
+    // module like Sharp) shows up downstream as "oRPC queue closed/aborted"
+    // when the renderer tries the first IPC call — extremely hard to diagnose.
+    // Surface the failure as a native error dialog so the user (and any
+    // future debugger reading this codebase) can immediately see what broke.
+    const message = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error && error.stack ? error.stack : "";
     console.error("Error during app initialization:", error);
+    dialog.showErrorBox(
+      "Webtoon Stitch & Split — startup error",
+      `${message}\n\n${stack}`,
+    );
+    app.quit();
   }
 });
 
