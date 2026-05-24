@@ -238,6 +238,23 @@ Pure Node/Sharp module with no Electron imports. Exports:
 
 Internal helpers: `readImagePaths`, `resetOutputDir`, `createStitchedImage`, `findUniformRowRuns`, `buildSlicesFromRuns`, `writeSlices`, `isUniformRow`, `getRowColor`, `isColorWithinTolerance`, `snapToCanonicalColor`, `pushRun`, `extractEdgeStrip`.
 
+### Logging and Debugging in Production
+
+Electron Windows builds are GUI apps that don't attach to a console — `console.log` / `console.error` writes are discarded by default. The app ships with three mechanisms to make production failures debuggable:
+
+1. **File logger** (`src/utils/logger.ts`): patches `console.log` / `info` / `warn` / `error` / `debug` to also append to a log file at `app.getPath('logs')/main.log`, plus installs `uncaughtException` and `unhandledRejection` handlers. Initialised at the very top of `app.whenReady()` so every subsequent log line in the main process is captured. Log file path per platform:
+   - Windows: `%LocalAppData%\<app-name>\logs\main.log`
+   - macOS: `~/Library/Logs/<app-name>/main.log`
+   - Linux: `~/.config/<app-name>/logs/main.log`
+
+2. **oRPC error surfacing** (`src/ipc/handler.ts`): the `RPCHandler` is configured with:
+   - `interceptors: [onError((err) => console.error(...))]` — logs full handler errors with stack traces to the log file.
+   - `clientInterceptors: [onError(...)]` — replaces oRPC's default `"Internal server error"` sanitized message with the actual error message + cause, so the React UI's status display shows the real cause (e.g. `"ENOENT: no such file or directory"`) instead of a useless generic string.
+
+3. **DevTools in production**: `webPreferences.devTools: true` is set unconditionally. Users can open DevTools with `Cmd/Ctrl+Shift+I` or right-click → Inspect to see renderer-side errors, network requests, and React state. This is acceptable for an internal/personal tool — for public distribution, gate behind a debug flag.
+
+When a user reports a bug, ask them for the last ~50 lines of `main.log` and any errors in the renderer console.
+
 ### Custom Protocol (`local-file://`)
 
 The renderer runs on a Vite dev server (`http://localhost`) during development, which blocks `file://` resource loading. A custom `local-file` scheme is registered to serve local files consistently in both dev and production.

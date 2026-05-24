@@ -124,6 +124,33 @@ xattr -dr com.apple.quarantine "/Applications/Webtoon Stitch & Split.app"
 
 Producing signed and notarized builds would require purchasing an Apple Developer ID certificate (~$99/year) and adding it as a GitHub Actions secret; tracked separately, not part of the current build pipeline.
 
+## Troubleshooting
+
+When the app fails in a production install, two places have the diagnostic info:
+
+### 1. `main.log` (main-process logs)
+
+All `console.log` / `console.error` output from the main process — including handler errors, uncaught exceptions, and unhandled promise rejections — is appended to a per-platform log file:
+
+- **Windows**: `%LocalAppData%\wt_split_desktop_app\logs\main.log` (paste into File Explorer's address bar to open)
+- **macOS**: `~/Library/Logs/Webtoon Stitch & Split/main.log`
+- **Linux**: `~/.config/Webtoon Stitch & Split/logs/main.log`
+
+Each session starts with a `=== <ISO timestamp> | session start | pid=... | electron=... ===` banner so you can find the relevant session quickly. When reporting a bug, paste the last ~50 lines starting from the most recent session banner.
+
+### 2. DevTools (renderer-side logs)
+
+The app ships with DevTools enabled in production builds. Open with `Ctrl+Shift+I` (Windows/Linux) or `Cmd+Option+I` (macOS), or right-click anywhere → Inspect. Check the **Console** tab for renderer-side errors and the **Network** tab if a request looks suspicious.
+
+### Common issues
+
+| Symptom | Likely cause | Where to look |
+|---|---|---|
+| Status display shows `Error: ENOENT...` or similar | A file system path doesn't exist | Check the path in the input/output folder pickers |
+| Status display shows `Error: Input image exceeds pixel limit` | Stitched image is too large for Sharp's default 268MP limit | Try processing fewer images at a time |
+| App opens but folder picker does nothing | Likely a Sharp / native module init failure — main process crashed at startup | Check `main.log` for an `Error during app initialization` entry near the most recent session banner |
+| App crashes silently on launch | Catch-all fallback — main process died before the error dialog could fire | Run the `.exe` from `cmd` so any synchronous stderr output is visible, then check `main.log` |
+
 ## Auto update
 
 > [!WARNING]

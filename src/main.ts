@@ -20,7 +20,8 @@ import {
 } from "electron-devtools-installer";
 import { UpdateSourceType, updateElectronApp } from "update-electron-app";
 import { ipcContext } from "@/ipc/context";
-import { IPC_CHANNELS, inDevelopment } from "./constants";
+import { IPC_CHANNELS } from "./constants";
+import { setupFileLogger } from "./utils/logger";
 import { getBasePath } from "./utils/path";
 
 // Squirrel (the Windows installer/updater Forge uses) spawns this exe with
@@ -66,7 +67,11 @@ function createWindow() {
     width: 1000,
     height: 800,
     webPreferences: {
-      devTools: inDevelopment,
+      // DevTools are enabled even in production builds because this is an
+      // internal/personal tool — easier to debug renderer-side issues when
+      // they happen on users' machines. For a public-distribution build,
+      // gate this behind an env var or feature flag.
+      devTools: true,
       contextIsolation: true,
       nodeIntegration: true,
       nodeIntegrationInSubFrames: false,
@@ -136,6 +141,12 @@ async function setupORPC() {
 }
 
 app.whenReady().then(async () => {
+  // Initialise the file logger BEFORE anything else inside app.whenReady so
+  // any subsequent failure (Sharp load error, dialog crash, etc.) is captured
+  // to %LocalAppData%\<app>\logs\main.log on Windows or the platform
+  // equivalent. Without this, production failures are invisible.
+  setupFileLogger();
+
   try {
     // MIME types for the local-file:// protocol handler.
     const MIME_TYPES: Record<string, string> = {
@@ -178,18 +189,22 @@ app.whenReady().then(async () => {
     checkForUpdates();
     await setupORPC();
   } catch (error) {
-    // Loud-failure path: in packaged builds, console output is invisible to
-    // the user. If we only log here, a broken init (e.g., a missing native
-    // module like Sharp) shows up downstream as "oRPC queue closed/aborted"
-    // when the renderer tries the first IPC call — extremely hard to diagnose.
+    // Loud-failure path: in packaged builds, console output goes to the file
+    // logger initialised above. A broken init (e.g., a missing native module
+    // like Sharp) used to show up downstream as "oRPC queue closed/aborted"
+    // when the renderer tried its first IPC call — extremely hard to diagnose.
     // Surface the failure as a native error dialog so the user (and any
     // future debugger reading this codebase) can immediately see what broke.
     const message = error instanceof Error ? error.message : String(error);
     const stack = error instanceof Error && error.stack ? error.stack : "";
     console.error("Error during app initialization:", error);
+    // Import lazily to avoid a circular dependency with utils/logger.
+    const { getLogFilePath } = await import("./utils/logger");
+    const logPath = getLogFilePath();
+    const logHint = logPath ? `\n\nFull log: ${logPath}` : "";
     dialog.showErrorBox(
       "Webtoon Stitch & Split — startup error",
-      `${message}\n\n${stack}`,
+      `${message}\n\n${stack}${logHint}`,
     );
     app.quit();
   }
