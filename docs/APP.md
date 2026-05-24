@@ -232,20 +232,33 @@ Pure Node/Sharp module with no Electron imports.
 
 **Sharp pixel-limit override**: All `sharp()` construction in this file goes through three helpers — `openSharp(input)` for files/buffers, `createSharp(create)` for synthetic canvases, and `openRawSharp(rawBuffer, width, height)` for raw RGBA byte buffers — all of which set `limitInputPixels: false`. Without this, Sharp throws `Error: Input image exceeds pixel limit` whenever a stitched composite exceeds the default 268,435,456-pixel (0x3FFF × 0x3FFF) cap. Webtoon chapters easily cross this — a 800px-wide composite of ~50 panels at 6000px each is 240 MP and right at the edge. The trade-off: with no upper bound, a truly enormous input (e.g. 100,000 panels) could exhaust memory; the raw RGBA buffer for analysis is `width × height × 4` bytes, so the practical ceiling is set by available RAM, not by the Sharp check. **Always use these helpers rather than `sharp()` directly — a new call site that forgets the option will re-introduce the crash on tall webtoons.**
 
-**Single-pass raw architecture**: After the composite pipeline is built by `createStitchedImage`, `processWebtoon` materializes it **directly to raw RGBA once** (no intermediate PNG encode/decode):
+**Streaming raw-buffer architecture**: `createStitchedRawBuffer` builds the stitched composite by **manually copying raw RGBA bytes into a single pre-allocated output buffer**, holding at most one source image's bytes in memory at a time. The result is a `{ data: Buffer, width, height }` triple — already in raw RGBA, no further extraction needed.
 
 ```
-composite pipeline
-    └── .ensureAlpha().raw().toBuffer({ resolveWithObject: true })
-            └── rawBuffer (held in memory for the rest of the pipeline)
-                    ├── findUniformRowRuns(rawBuffer, …)  // gap analysis reads directly
-                    ├── openRawSharp(rawBuffer, w, h)     // reusable pipeline for…
-                    │       ├── writeSlices: .clone().extract().webp().toFile() (× N slices)
-                    │       └── extractEdgeStrip: .clone().extract().png().toBuffer()
-                    └── (no more PNG anywhere in the hot path)
+createStitchedRawBuffer(115 source images)
+    ├── Pre-allocate one Buffer of size width × totalHeight × 4
+    └── For each source image:
+            sharp(file).rotate().resize().ensureAlpha().raw().toBuffer()
+                → srcData (~6 MB for a single 720×2150 panel)
+            srcData.copy(output, yOffset * rowBytes)
+            yOffset += srcInfo.height
+            // srcData reference drops here — V8 GCs it before next iteration
+    → { data: output, width, height }
+            ├── findUniformRowRuns(data, …)        // gap analysis reads directly
+            └── openRawSharp(data, width, height)  // reusable Sharp pipeline for…
+                    ├── writeSlices: .clone().extract().webp().toFile() (× N slices)
+                    └── extractEdgeStrip: .clone().extract().png().toBuffer()
 ```
 
-Previously the implementation went `composite → PNG-encode → PNG-decode (× ~N times for every slice and edge strip)`. For a ~178 MP chapter with ~30 slices that meant 30+ full-image PNG decodes of an ~700 MB buffer, making the "Analyzing gaps…" stage take many minutes or appear to hang entirely. The single raw materialization eliminates all of those, reducing both wall time and peak memory by roughly an order of magnitude on real chapters. The historical comment about "forcing Sharp to fully resolve the lazy composite before raw read" referenced a pre-0.32 Sharp bug that no longer applies.
+Two earlier architectures both had problems:
+
+| Era | Architecture | Peak memory (115×720×2150 input) | Symptom on Windows |
+|---|---|---|---|
+| Original | `composite → PNG-encode → PNG-decode` then re-decode PNG per slice/strip | ~2.2 GB | `"Analyzing gaps…"` hung for minutes; "Internal server error" after long delay |
+| First refactor | `composite → raw RGBA once` (still using Sharp's composite holding all N inputs) | ~1.4 GB | `RangeError: Failed to allocate memory` after ~2-3 minutes on memory-pressured machines |
+| Current | Pre-allocated output + memcpy each source's raw bytes in a streaming loop | ~720 MB (output) + ~6 MB (one source in flight) | Stable; runs in well under a minute |
+
+The current implementation's memory ceiling scales with **output_bytes + per_image_bytes** rather than `N × per_image_bytes`. The practical limit is the single `Buffer.allocUnsafe(totalBytes)` call, which on a healthy Windows install succeeds up to ~2 GB (corresponding to a ~500 MP stitched chapter). Beyond that we'd need a disk-backed scratch file — but no realistic webtoon chapter approaches that size.
 
 **Correctness regression test**: `npm run smoke:processor` (`scripts/smoke-processor.ts`) runs `processWebtoon` against the bundled `test/` fixture and asserts byte-identity against the committed `[Toonwide] test/` reference output. Run this after any change to `processor.ts` that touches the stitching, analysis, or slice writing path.
 

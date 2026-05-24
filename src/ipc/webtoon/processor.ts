@@ -234,42 +234,33 @@ export async function processWebtoon({
   await resetOutputDir(outputDir);
 
   onProgress?.({ stage: "stitching", detail: `${imagePaths.length} images` });
-  const stitched = await createStitchedImage(imagePaths);
+  // Streaming stitch: one source image is in memory at a time, output is
+  // a single pre-allocated raw RGBA buffer. Replaces the previous Sharp
+  // .composite() pipeline that held all source buffers simultaneously plus
+  // a libvips intermediate, which OOM'd V8 on ~115-image webtoon chapters.
+  const stitched = await createStitchedRawBuffer(imagePaths);
 
   onProgress?.({ stage: "analyzing" });
 
-  // Materialize the composite directly to raw RGBA — no PNG round-trip.
-  //
-  // Why: the previous implementation did composite → PNG-encode → PNG-decode
-  // → raw, then RE-DECODED the same PNG for each slice write and each edge
-  // strip extraction. For a ~400 MP stitched chapter with ~30 slices, that
-  // was ~30+ full PNG decodes of a multi-GB buffer, making the "Analyzing
-  // gaps…" stage take many minutes (or appear to hang entirely).
-  //
-  // Going straight to raw collapses that into a single composite render +
-  // one raw buffer that's reused everywhere downstream. ensureAlpha()
-  // guarantees 4 channels even if the source was RGB. The historical
-  // workaround comment ("forces Sharp to fully resolve the lazy composite
-  // before raw read") references a pre-0.32 bug that no longer applies.
-  const { data: rawData, info } = await stitched
-    .ensureAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-
-  // Wrap the raw buffer as a reusable Sharp pipeline. Every subsequent
-  // .clone() / .extract() / .toFile() operates directly on this buffer
-  // without any image decoding overhead.
-  const stitchedSharp = openRawSharp(rawData, info.width, info.height);
+  // The stitched buffer IS the raw RGBA — no further extraction needed.
+  // findUniformRowRuns reads it directly. openRawSharp wraps the same
+  // buffer (no copy) as a Sharp pipeline so writeSlices / extractEdgeStrip
+  // can run .clone().extract().toFile() chains without ever PNG-decoding.
+  const stitchedSharp = openRawSharp(
+    stitched.data,
+    stitched.width,
+    stitched.height,
+  );
 
   const uniformRuns = findUniformRowRuns(
-    rawData,
-    info.width,
-    info.height,
+    stitched.data,
+    stitched.width,
+    stitched.height,
     colorTolerance ?? DEFAULT_COLOR_TOLERANCE,
   );
   const slices = buildSlicesFromRuns(
     uniformRuns,
-    info.height,
+    stitched.height,
     minGapHeight ?? DEFAULT_MIN_GAP_HEIGHT,
   );
 
@@ -277,7 +268,7 @@ export async function processWebtoon({
     stitchedSharp,
     slices,
     outputDir,
-    info.width,
+    stitched.width,
     onProgress,
   );
 
@@ -305,7 +296,7 @@ export async function processWebtoon({
     const firstStrip = await extractEdgeStrip(
       stitchedSharp,
       firstSlice.top,
-      info.width,
+      stitched.width,
     );
     segments[0].topEdgeStrip = firstStrip.dataUri;
     segments[0].topEdgeStripIsLight = firstStrip.isLight;
@@ -315,7 +306,7 @@ export async function processWebtoon({
     const lastStrip = await extractEdgeStrip(
       stitchedSharp,
       lastRow,
-      info.width,
+      stitched.width,
     );
     segments[segments.length - 1].bottomEdgeStrip = lastStrip.dataUri;
     segments[segments.length - 1].bottomEdgeStripIsLight = lastStrip.isLight;
@@ -519,16 +510,46 @@ async function resetOutputDir(dir: string): Promise<void> {
 }
 
 /**
- * createStitchedImage composites all input images into one tall vertical strip.
+ * Result of createStitchedRawBuffer: the raw RGBA bytes of the stitched image
+ * plus its dimensions. Always 4 channels (RGBA).
+ */
+interface StitchedRaw {
+  data: Buffer;
+  width: number;
+  height: number;
+}
+
+/**
+ * createStitchedRawBuffer stitches all input images into one tall vertical
+ * strip and returns the result as raw RGBA bytes ready for direct row-by-row
+ * analysis or further processing via openRawSharp().
+ *
+ * Memory-streaming design (replaces a previous Sharp.composite() approach):
+ *
+ *   1. Pre-allocate the final output buffer up front (width × height × 4 bytes).
+ *   2. For each source image, decode + rotate + resize + raw-extract INTO A
+ *      LOCAL VARIABLE, copy its bytes into the correct Y-offset of the output
+ *      buffer, then drop the local reference so V8 can GC it.
+ *   3. Return { data, width, height }.
+ *
+ * The old approach held all N resized raw buffers in a `composites` array AND
+ * then asked libvips to composite them onto a fresh canvas — so the peak
+ * memory was N × per-image-bytes + a same-size libvips intermediate. For a
+ * 115-image 720×2150 chapter that's ~1.4 GB peak, which exhausts V8's heap on
+ * memory-pressured Windows machines (RangeError: Failed to allocate memory).
+ *
+ * The new approach keeps at most one source buffer in memory plus the
+ * pre-allocated output, so peak is ~`output_bytes + per_image_bytes` (~720 MB
+ * for the same input). The per-byte work (memcpy via Buffer.copy) is faster
+ * than libvips composite's per-pixel alpha blending too, since we know all
+ * placements are non-overlapping and opaque.
  *
  * EXIF orientations 5-8 swap width and height, so we compute "oriented"
- * dimensions before determining the target width. Each image is auto-rotated
- * and resized to the widest input's width, then placed top-to-bottom on a
- * transparent RGBA canvas.
+ * dimensions during the metadata pass before deciding targetWidth.
  */
-async function createStitchedImage(
+async function createStitchedRawBuffer(
   imagePaths: string[],
-): Promise<sharp.Sharp> {
+): Promise<StitchedRaw> {
   const metadata: ImageMeta[] = await Promise.all(
     imagePaths.map(async (file) => {
       const meta = await openSharp(file).metadata();
@@ -546,26 +567,81 @@ async function createStitchedImage(
   );
 
   const targetWidth = Math.max(...metadata.map((m) => m.width));
-  const composites: sharp.OverlayOptions[] = [];
-  let totalHeight = 0;
 
-  for (const meta of metadata) {
-    // .rotate() without arguments applies EXIF-based auto-rotation.
-    const { data, info } = await openSharp(meta.file)
+  // Pre-compute exact scaled heights so we can size the output buffer up
+  // front. We use the same formula Sharp's resize uses (preserve aspect ratio,
+  // scale by width). Math.round matches Sharp's default rounding mode.
+  const scaledHeights = metadata.map((m) =>
+    m.width === targetWidth
+      ? m.height
+      : Math.round((m.height * targetWidth) / m.width),
+  );
+  const totalHeight = scaledHeights.reduce((sum, h) => sum + h, 0);
+
+  // Single large allocation. allocUnsafe skips zero-fill (we're about to
+  // overwrite every byte from the source images, so the initial contents
+  // don't matter). On a healthy Windows install this allocation succeeds
+  // up to ~2 GB; beyond that we'd need to refactor to disk-backed output.
+  const bytesPerPixel = 4;
+  const rowBytes = targetWidth * bytesPerPixel;
+  const totalBytes = rowBytes * totalHeight;
+  const output = Buffer.allocUnsafe(totalBytes);
+
+  let yOffset = 0;
+  for (let i = 0; i < metadata.length; i++) {
+    const meta = metadata[i];
+    const expectedHeight = scaledHeights[i];
+
+    // .rotate() without args applies EXIF-based auto-rotation.
+    // .ensureAlpha() guarantees 4 channels even if the source was RGB,
+    // so the byte layout matches the output buffer.
+    // .raw() outputs uncompressed bytes — no PNG/WebP encode overhead.
+    const { data: srcData, info: srcInfo } = await openSharp(meta.file)
       .rotate()
       .resize({ width: targetWidth })
+      .ensureAlpha()
+      .raw()
       .toBuffer({ resolveWithObject: true });
 
-    composites.push({ input: data, top: totalHeight, left: 0 });
-    totalHeight += info.height;
+    if (srcInfo.width !== targetWidth) {
+      throw new Error(
+        `Resize for ${meta.file} produced width ${srcInfo.width}, expected ${targetWidth}`,
+      );
+    }
+
+    // Single memcpy of the full image into the right Y offset. The slice we
+    // copy is the full source buffer; the destination offset is
+    // yOffset * rowBytes. No per-row loop needed since rows are contiguous in
+    // both source and destination (same width).
+    const destStart = yOffset * rowBytes;
+    srcData.copy(output, destStart);
+
+    // Sanity: if Sharp's actual scaled height differs from our prediction by
+    // more than 1px (rounding noise), we'd corrupt the layout. Use the actual
+    // value so subsequent iterations land in the right place.
+    if (Math.abs(srcInfo.height - expectedHeight) > 1) {
+      throw new Error(
+        `Resize for ${meta.file} produced height ${srcInfo.height}, expected ~${expectedHeight}`,
+      );
+    }
+    yOffset += srcInfo.height;
+    // srcData reference goes out of scope at the next loop iteration, freeing
+    // ~per-image-bytes for V8 to GC. Without this streaming design we'd hold
+    // all N source buffers in memory simultaneously.
   }
 
-  return createSharp({
-    width: targetWidth,
-    height: totalHeight,
-    channels: 4,
-    background: { r: 0, g: 0, b: 0, alpha: 0 },
-  }).composite(composites);
+  if (yOffset !== totalHeight) {
+    // One-off cumulative-rounding drift between predicted and actual heights.
+    // Truncate (or in theory pad) the output buffer. In practice this branch
+    // is essentially never taken; the guard is here for forensic clarity.
+    return {
+      data: output.subarray(0, yOffset * rowBytes),
+      width: targetWidth,
+      height: yOffset,
+    };
+  }
+
+  return { data: output, width: targetWidth, height: totalHeight };
 }
 
 /**
