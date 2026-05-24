@@ -70,7 +70,7 @@ function createSharp(create: sharp.Create): sharp.Sharp {
 /**
  * Wraps an in-memory raw RGBA buffer as a Sharp pipeline. Sharp's raw input
  * mode skips both image decoding and re-encoding entirely — each subsequent
- * .clone() / .extract() / .toFile() reads directly from the buffer.
+ * .extract() / .toFile() reads directly from the buffer.
  *
  * Used by the main processWebtoon pipeline to avoid the previous architecture's
  * double-encode loop:
@@ -92,6 +92,27 @@ function openRawSharp(
     raw: { width, height, channels: 4 },
   });
 }
+
+/**
+ * Factory that produces a fresh Sharp pipeline backed by the same underlying
+ * input (file path, raw buffer, etc.) on each invocation.
+ *
+ * **Why not just use `pipeline.clone()`?** Sharp.prototype.clone() calls
+ * `structuredClone(this.options)`, which serialises the input. For a large
+ * Node Buffer (e.g. our ~700 MB stitched raw RGBA), `structuredClone` throws
+ * `DataCloneError: ArrayBuffer could not be cloned` on Windows + Node 22+
+ * because pool-backed Buffers are marked untransferable (see
+ * https://github.com/nodejs/node/issues/55593 and Sharp issue #1660).
+ *
+ * The factory pattern sidesteps the bug entirely: each call constructs a new
+ * Sharp pipeline that holds a *reference* to the same underlying input —
+ * zero copying of pixel data, no structuredClone, no DataCloneError.
+ *
+ * Convention: call sites that previously did `instance.clone().extract().toFile()`
+ * now do `factory().extract().toFile()`. Cost is one Sharp pipeline-object
+ * allocation per call (~µs).
+ */
+type SharpFactory = () => sharp.Sharp;
 
 interface ProcessWebtoonInput {
   inputDir: string;
@@ -243,14 +264,13 @@ export async function processWebtoon({
   onProgress?.({ stage: "analyzing" });
 
   // The stitched buffer IS the raw RGBA — no further extraction needed.
-  // findUniformRowRuns reads it directly. openRawSharp wraps the same
-  // buffer (no copy) as a Sharp pipeline so writeSlices / extractEdgeStrip
-  // can run .clone().extract().toFile() chains without ever PNG-decoding.
-  const stitchedSharp = openRawSharp(
-    stitched.data,
-    stitched.width,
-    stitched.height,
-  );
+  // findUniformRowRuns reads it directly. stitchedFactory builds a fresh
+  // Sharp pipeline wrapping the same buffer on each call, which writeSlices
+  // and extractEdgeStrip use to extract regions without ever hitting
+  // Sharp.clone() (whose structuredClone would throw DataCloneError on the
+  // large pool-backed Buffer on Windows + Node 22+).
+  const stitchedFactory: SharpFactory = () =>
+    openRawSharp(stitched.data, stitched.width, stitched.height);
 
   const uniformRuns = findUniformRowRuns(
     stitched.data,
@@ -265,7 +285,7 @@ export async function processWebtoon({
   );
 
   const written = await writeSlices(
-    stitchedSharp,
+    stitchedFactory,
     slices,
     outputDir,
     stitched.width,
@@ -294,7 +314,7 @@ export async function processWebtoon({
   if (segments.length > 0) {
     const firstSlice = slices[0];
     const firstStrip = await extractEdgeStrip(
-      stitchedSharp,
+      stitchedFactory,
       firstSlice.top,
       stitched.width,
     );
@@ -304,7 +324,7 @@ export async function processWebtoon({
     const lastSlice = slices[slices.length - 1];
     const lastRow = lastSlice.top + lastSlice.height - 1;
     const lastStrip = await extractEdgeStrip(
-      stitchedSharp,
+      stitchedFactory,
       lastRow,
       stitched.width,
     );
@@ -398,7 +418,11 @@ export async function splitSegment({
   // Extract 1px-tall edge strips at interior split boundaries BEFORE
   // potentially deleting the source file. The source is needed for extraction.
   const numChildren = edges.length - 1;
-  const sourceSharp = openSharp(filePath);
+  // Factory rebuilds a Sharp pipeline from the file path on each call. For
+  // file-backed input the cost is negligible (OS file cache hit + new pipeline
+  // object); the factory pattern is shared with the in-memory case in
+  // processWebtoon so neither path uses Sharp.clone() — see SharpFactory.
+  const sourceFactory: SharpFactory = () => openSharp(filePath);
   const edgeStrips: EdgeStripData[] = [];
   for (let i = 0; i < numChildren; i++) {
     // Exterior edges (first-top, last-bottom) are null — the renderer
@@ -407,10 +431,10 @@ export async function splitSegment({
     const isLast = i === numChildren - 1;
     const topResult = isFirst
       ? null
-      : await extractEdgeStrip(sourceSharp, edges[i], width);
+      : await extractEdgeStrip(sourceFactory, edges[i], width);
     const bottomResult = isLast
       ? null
-      : await extractEdgeStrip(sourceSharp, edges[i + 1] - 1, width);
+      : await extractEdgeStrip(sourceFactory, edges[i + 1] - 1, width);
     edgeStrips.push({
       topEdgeStrip: topResult?.dataUri ?? null,
       bottomEdgeStrip: bottomResult?.dataUri ?? null,
@@ -776,7 +800,7 @@ function buildSlicesFromRuns(
 
 /** writeSlices extracts each slice from the stitched image and writes it as WebP lossless. */
 async function writeSlices(
-  stitched: sharp.Sharp,
+  factory: SharpFactory,
   slices: Slice[],
   dir: string,
   width: number,
@@ -793,9 +817,11 @@ async function writeSlices(
     }
     const filename = `segment_${String(index).padStart(3, "0")}.webp`;
     const outPath = path.join(dir, filename);
-    // .clone() is required because Sharp pipelines are consumed on first use.
-    await stitched
-      .clone()
+    // factory() returns a fresh Sharp pipeline backed by the same input each
+    // time. We don't use stitched.clone() here because Sharp.clone() calls
+    // structuredClone(options) which throws DataCloneError on large pool-
+    // backed Buffers in Node 22+ on Windows. See SharpFactory JSDoc.
+    await factory()
       .extract({ left: 0, top: slice.top, width, height: slice.height })
       .webp({ lossless: true })
       .toFile(outPath);
@@ -882,20 +908,29 @@ function rgbToHex({ r, g, b }: RgbColor): string {
  * light or dark. Used for gradient gap rendering in the web reader and
  * brightness-aware column bottom gap fill color selection.
  *
- * @param source - Sharp instance opened on the source image.
+ * @param factory - Produces a fresh Sharp pipeline on each call; see
+ *   SharpFactory JSDoc for why this isn't `source: sharp.Sharp` + `.clone()`.
  * @param row - The 0-indexed row to extract.
  * @param width - Image width (determines the strip length).
  * @returns Data URI and brightness classification.
  */
 async function extractEdgeStrip(
-  source: sharp.Sharp,
+  factory: SharpFactory,
   row: number,
   width: number,
 ): Promise<{ dataUri: string; isLight: boolean }> {
-  const strip = source.clone().extract({ left: 0, top: row, width, height: 1 });
+  // Each branch builds its own fresh Sharp pipeline so we never hit
+  // structuredClone via Sharp.clone() — would throw DataCloneError on Windows
+  // for large pool-backed Buffers. Both pipelines share the same input
+  // reference (no pixel copy).
+  const extractOptions = { left: 0, top: row, width, height: 1 };
   const [pngBuffer, { data: rawPixels }] = await Promise.all([
-    strip.clone().png().toBuffer(),
-    strip.clone().ensureAlpha().raw().toBuffer({ resolveWithObject: true }),
+    factory().extract(extractOptions).png().toBuffer(),
+    factory()
+      .extract(extractOptions)
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true }),
   ]);
   // Average perceived luminance using the standard Rec. 601 formula
   let totalLuminance = 0;
