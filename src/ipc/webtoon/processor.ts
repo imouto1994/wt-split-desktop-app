@@ -67,6 +67,32 @@ function createSharp(create: sharp.Create): sharp.Sharp {
   return sharp({ create, ...SHARP_OPTS });
 }
 
+/**
+ * Wraps an in-memory raw RGBA buffer as a Sharp pipeline. Sharp's raw input
+ * mode skips both image decoding and re-encoding entirely — each subsequent
+ * .clone() / .extract() / .toFile() reads directly from the buffer.
+ *
+ * Used by the main processWebtoon pipeline to avoid the previous architecture's
+ * double-encode loop:
+ *
+ *   OLD: composite → PNG-encode → PNG-decode (×N for each slice + edge strip)
+ *   NEW: composite → raw RGBA (once) → direct slice extraction
+ *
+ * For a 400 MP stitched chapter with ~30 slices, this eliminates ~30 full
+ * PNG-decode passes (each ~30-60s) — turning a multi-minute "Analyzing gaps…"
+ * stage into near-instant raw scan + fast slice writes.
+ */
+function openRawSharp(
+  rawBuffer: Buffer,
+  width: number,
+  height: number,
+): sharp.Sharp {
+  return sharp(rawBuffer, {
+    ...SHARP_OPTS,
+    raw: { width, height, channels: 4 },
+  });
+}
+
 interface ProcessWebtoonInput {
   inputDir: string;
   outputDir: string;
@@ -210,26 +236,33 @@ export async function processWebtoon({
   onProgress?.({ stage: "stitching", detail: `${imagePaths.length} images` });
   const stitched = await createStitchedImage(imagePaths);
 
-  // Materialize the composite to a PNG buffer, then re-open it.
-  // This forces Sharp to fully resolve the lazy composite pipeline before
-  // we attempt a raw pixel read, avoiding "no pixels" errors.
-  const stitchedBuffer = await stitched.png().toBuffer();
-  // openSharp() disables the pixel-limit check that would reject this large
-  // stitched composite (see SHARP_OPTS comment at the top of this file).
-  const stitchedSharp = openSharp(stitchedBuffer);
-
   onProgress?.({ stage: "analyzing" });
 
-  // Extract raw RGBA pixel data for row-by-row gap analysis.
-  // ensureAlpha() guarantees 4 channels even if the source was RGB.
-  const { data, info } = await stitchedSharp
-    .clone()
+  // Materialize the composite directly to raw RGBA — no PNG round-trip.
+  //
+  // Why: the previous implementation did composite → PNG-encode → PNG-decode
+  // → raw, then RE-DECODED the same PNG for each slice write and each edge
+  // strip extraction. For a ~400 MP stitched chapter with ~30 slices, that
+  // was ~30+ full PNG decodes of a multi-GB buffer, making the "Analyzing
+  // gaps…" stage take many minutes (or appear to hang entirely).
+  //
+  // Going straight to raw collapses that into a single composite render +
+  // one raw buffer that's reused everywhere downstream. ensureAlpha()
+  // guarantees 4 channels even if the source was RGB. The historical
+  // workaround comment ("forces Sharp to fully resolve the lazy composite
+  // before raw read") references a pre-0.32 bug that no longer applies.
+  const { data: rawData, info } = await stitched
     .ensureAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
+  // Wrap the raw buffer as a reusable Sharp pipeline. Every subsequent
+  // .clone() / .extract() / .toFile() operates directly on this buffer
+  // without any image decoding overhead.
+  const stitchedSharp = openRawSharp(rawData, info.width, info.height);
+
   const uniformRuns = findUniformRowRuns(
-    data,
+    rawData,
     info.width,
     info.height,
     colorTolerance ?? DEFAULT_COLOR_TOLERANCE,

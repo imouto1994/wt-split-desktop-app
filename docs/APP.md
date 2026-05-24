@@ -230,7 +230,24 @@ The `pickInput`, `pickOutput`, and `processWebtoon` handlers use the `ipcContext
 
 Pure Node/Sharp module with no Electron imports.
 
-**Sharp pixel-limit override**: All `sharp()` construction in this file goes through two helpers — `openSharp(input)` for files/buffers and `createSharp(create)` for synthetic canvases — both of which set `limitInputPixels: false`. Without this, Sharp throws `Error: Input image exceeds pixel limit` whenever a stitched composite exceeds the default 268,435,456-pixel (0x3FFF × 0x3FFF) cap. Webtoon chapters easily cross this — a 800px-wide composite of ~50 panels at 6000px each is 240 MP and right at the edge. The trade-off: with no upper bound, a truly enormous input (e.g. 100,000 panels) could exhaust memory; the raw RGBA buffer for analysis is `width × height × 4` bytes, so the practical ceiling is set by available RAM, not by the Sharp check. **Always use these helpers rather than `sharp()` directly — a new call site that forgets the option will re-introduce the crash on tall webtoons.**
+**Sharp pixel-limit override**: All `sharp()` construction in this file goes through three helpers — `openSharp(input)` for files/buffers, `createSharp(create)` for synthetic canvases, and `openRawSharp(rawBuffer, width, height)` for raw RGBA byte buffers — all of which set `limitInputPixels: false`. Without this, Sharp throws `Error: Input image exceeds pixel limit` whenever a stitched composite exceeds the default 268,435,456-pixel (0x3FFF × 0x3FFF) cap. Webtoon chapters easily cross this — a 800px-wide composite of ~50 panels at 6000px each is 240 MP and right at the edge. The trade-off: with no upper bound, a truly enormous input (e.g. 100,000 panels) could exhaust memory; the raw RGBA buffer for analysis is `width × height × 4` bytes, so the practical ceiling is set by available RAM, not by the Sharp check. **Always use these helpers rather than `sharp()` directly — a new call site that forgets the option will re-introduce the crash on tall webtoons.**
+
+**Single-pass raw architecture**: After the composite pipeline is built by `createStitchedImage`, `processWebtoon` materializes it **directly to raw RGBA once** (no intermediate PNG encode/decode):
+
+```
+composite pipeline
+    └── .ensureAlpha().raw().toBuffer({ resolveWithObject: true })
+            └── rawBuffer (held in memory for the rest of the pipeline)
+                    ├── findUniformRowRuns(rawBuffer, …)  // gap analysis reads directly
+                    ├── openRawSharp(rawBuffer, w, h)     // reusable pipeline for…
+                    │       ├── writeSlices: .clone().extract().webp().toFile() (× N slices)
+                    │       └── extractEdgeStrip: .clone().extract().png().toBuffer()
+                    └── (no more PNG anywhere in the hot path)
+```
+
+Previously the implementation went `composite → PNG-encode → PNG-decode (× ~N times for every slice and edge strip)`. For a ~178 MP chapter with ~30 slices that meant 30+ full-image PNG decodes of an ~700 MB buffer, making the "Analyzing gaps…" stage take many minutes or appear to hang entirely. The single raw materialization eliminates all of those, reducing both wall time and peak memory by roughly an order of magnitude on real chapters. The historical comment about "forcing Sharp to fully resolve the lazy composite before raw read" referenced a pre-0.32 Sharp bug that no longer applies.
+
+**Correctness regression test**: `npm run smoke:processor` (`scripts/smoke-processor.ts`) runs `processWebtoon` against the bundled `test/` fixture and asserts byte-identity against the committed `[Toonwide] test/` reference output. Run this after any change to `processor.ts` that touches the stitching, analysis, or slice writing path.
 
 Exports:
 
